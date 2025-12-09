@@ -121,7 +121,7 @@ def matmul_persistent(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor = Non
         stride_bias = 1  # 虚拟值
         HAS_BIAS = False
     # 启动Triton内核
-    matmul_bias_kernel[grid](
+    matmul_bias_persistent_kernel[grid](
         a_ptr=x,
         b_ptr=y,
         bias_ptr=bias_ptr,
