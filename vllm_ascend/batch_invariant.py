@@ -505,28 +505,30 @@ def softmax_batch_invariant(input, dim, dtype=None):
     sum_exp_x = torch.sum(exp_x, dim=dim, keepdim=True)
     return exp_x / sum_exp_x
 
+_batch_invariant_LIB = None
 
 def enable_batch_invariant_mode():
+    global _batch_invariant_LIB
 
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "PrivateUse1")
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "PrivateUse1")
+    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "NPU")
+    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "NPU")
     _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant,
-                              "NPrivateUse1PU")
+                              "NPU")
     _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant,
-                              "PrivateUse1")
+                              "NPU")
     _batch_invariant_LIB.impl("aten::_log_softmax",
-                              _log_softmax_batch_invariant, "PrivateUse1")
+                              _log_softmax_batch_invariant, "NPU")
     _batch_invariant_LIB.impl("aten::softmax", softmax_batch_invariant,
-                              "PrivateUse1")
+                              "NPU")
     _batch_invariant_LIB.impl("aten::_softmax", softmax_batch_invariant,
-                              "PrivateUse1")
+                              "NPU")
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant,
-                              "PrivateUse1")
+                              "NPU")
 
     # Also monkeypatch torch.bmm directly as a fallback
-    _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "PrivateUse1")
+    _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "NPU")
     _original_torch_bmm = torch.bmm
     torch.bmm = bmm_batch_invariant
 
