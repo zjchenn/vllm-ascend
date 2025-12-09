@@ -48,7 +48,8 @@ def matmul_bias_persistent_kernel(
     )
     c_block_ptr = tl.make_block_ptr(
         base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
-        offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),  # 当前块在c中的偏移        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0)
+        offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),  # 当前块在c中的偏移        
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0)
     )
 
     # 初始化累加器（使用float32避免精度损失）
