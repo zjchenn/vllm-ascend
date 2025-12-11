@@ -98,9 +98,9 @@ def matmul_persistent(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor = Non
     c = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
     # 设置块大小（必须为2的幂，Triton的约束）
-    BLOCK_SIZE_M = min(triton.next_power_of_2(M) // 2, 128)
-    BLOCK_SIZE_N = min(triton.next_power_of_2(N) // 2, 128)
-    BLOCK_SIZE_K = min(triton.next_power_of_2(K) // 2, 128)
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 128
 
     # 计算网格大小（每个输出块一个程序实例）
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
