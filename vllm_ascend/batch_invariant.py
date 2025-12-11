@@ -57,8 +57,8 @@ def matmul_bias_persistent_kernel(
 
     # 循环遍历K维度，分块计算矩阵乘
     for k in range(0, K, BLOCK_SIZE_K):
-        a = tl.load(a_block_ptr)  # 加载a的块，形状为(BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_block_ptr)  # 加载b的块，形状为(BLOCK_SIZE_K, BLOCK_SIZE_N)
+        a = tl.load(a_block_ptr).to(tl.float32)  # 加载a的块，形状为(BLOCK_SIZE_M, BLOCK_SIZE_K)
+        b = tl.load(b_block_ptr).to(tl.float32) # 加载b的块，形状为(BLOCK_SIZE_K, BLOCK_SIZE_N)
         acc += tl.dot(a, b)  # 矩阵乘累加
         # 前进指针到下一个K块
         a_block_ptr = tl.advance(a_block_ptr, [0, BLOCK_SIZE_K])
@@ -71,7 +71,7 @@ def matmul_bias_persistent_kernel(
         bias_mask = col_offsets < N
 
         # 直接使用指针偏移加载bias
-        bias_vals = tl.load(bias_ptr + col_offsets, mask=bias_mask, other=0.0)
+        bias_vals = tl.load(bias_ptr + col_offsets, mask=bias_mask, other=0.0).to(tl.float32)
 
         # 将bias广播到整个块并加到累加器
         acc += bias_vals[None, :]  # 广播到(BLOCK_SIZE_M, BLOCK_SIZE_N)
@@ -98,9 +98,12 @@ def matmul_persistent(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor = Non
     c = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
     # 设置块大小（必须为2的幂，Triton的约束）
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
+    # BLOCK_SIZE_M = 128
+    # BLOCK_SIZE_N = 128
+    # BLOCK_SIZE_K = 128
+    BLOCK_SIZE_M = min(triton.next_power_of_2(M) // 2, 128)
+    BLOCK_SIZE_N = min(triton.next_power_of_2(N) // 2, 128)
+    BLOCK_SIZE_K = min(triton.next_power_of_2(K) // 2, 128)
 
     # 计算网格大小（每个输出块一个程序实例）
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
@@ -137,6 +140,11 @@ def matmul_persistent(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor = Non
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         HAS_BIAS=HAS_BIAS,
     )
+
+    ref_c = torch.matmul(x, y)
+    if (not torch.allclose(c, ref_c, atol=1e-3, rtol=1e-3)):
+        print(x.shape)
+        print(y.shape)
 
     return c
 
