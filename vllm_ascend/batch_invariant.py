@@ -143,6 +143,7 @@ def matmul_persistent(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor = Non
 
     ref_c = torch.matmul(x, y)
     if (not torch.allclose(c, ref_c, atol=1e-3, rtol=1e-3)):
+        print("!!!!!!!!!!!!!!!!!!!")
         print(x.shape)
         print(y.shape)
 
