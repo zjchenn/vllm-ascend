@@ -15,139 +15,129 @@ from vllm.model_executor.layers.batch_invariant import (
 
 @triton.jit
 def matmul_bias_persistent_kernel(
-    # 输入输出张量的指针
-    a_ptr, b_ptr, bias_ptr, c_ptr,
+    # 输入张量指针
+    x_ptr, y_ptr, bias_ptr, output_ptr,
     # 矩阵维度
     M, N, K,
-    # 张量的步长（strides）
-    stride_am, stride_ak,  # a的步长：行步长、列步长
-    stride_bk, stride_bn,  # b的步长：行步长、列步长
-    stride_cm, stride_cn,  # c的步长
-    stride_bias,  # bias的步长（对于向量，通常为1）
-    # 块大小（必须为2的幂）
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    # 是否启用bias
-    HAS_BIAS: tl.constexpr,
+    # 步长信息
+    stride_xm, stride_xk,  # x的步长: [M, K]
+    stride_yk, stride_yn,  # y的步长: [K, N]  
+    stride_bias,           # bias的步长: [N]
+    stride_outm, stride_outn,  # 输出的步长: [M, N]
+    # 是否使用偏置
+    has_bias: tl.constexpr,
+    # 分块大小（常量表达式）
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # 获取当前程序实例的ID（处理输出矩阵的哪个块）
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
+    # 获取程序ID（2D网格）
+    pid_m = tl.program_id(0)  # 行分块ID
+    pid_n = tl.program_id(1)  # 列分块ID
+                
+    # 计算当前块在矩阵中的起始位置
+    rm_start = pid_m * BLOCK_M    
+    rn_start = pid_n * BLOCK_N
+    
+    # 创建索引范围
+    rm = rm_start + tl.arange(0, BLOCK_M)  # 行索引范围 [BLOCK_M]
+    rn = rn_start + tl.arange(0, BLOCK_N)  # 列索引范围 [BLOCK_N]
+    rk = tl.arange(0, BLOCK_K)              # K维度索引范围 [BLOCK_K]
+                                            
+    # 初始化累加器为0
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                                                        
+    # 在K维度上进行循环，每次处理BLOCK_K个元素
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_start = k * BLOCK_K        
+        # 计算x的指针偏移量（行主序）
+        x_ptrs = x_ptr + rm[:, None] * stride_xm + (rk[None, :] + k_start) * stride_xk        
+        # 计算y的指针偏移量（行主序）  
+        y_ptrs = y_ptr + (rk[:, None] + k_start) * stride_yk + rn[None, :] * stride_yn
 
-    # 创建块指针（block pointers）用于加载a和b的块
-    a_block_ptr = tl.make_block_ptr(
-        base=a_ptr, shape=(M, K), strides=(stride_am, stride_ak),
-        offsets=(pid_m * BLOCK_SIZE_M, 0),  # 当前块在a中的偏移
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), order=(1, 0)  # 行主序
-    )
-    b_block_ptr = tl.make_block_ptr(
-        base=b_ptr, shape=(K, N), strides=(stride_bk, stride_bn),
-        offsets=(0, pid_n * BLOCK_SIZE_N),  # 当前块在b中的偏移
-        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N), order=(1, 0)
-    )
-    c_block_ptr = tl.make_block_ptr(
-        base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
-        offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),  # 当前块在c中的偏移        
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0)
-    )
-
-    # 初始化累加器（使用float32避免精度损失）
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    # 循环遍历K维度，分块计算矩阵乘
-    for k in range(0, K, BLOCK_SIZE_K):
-        a = tl.load(a_block_ptr).to(tl.float32)  # 加载a的块，形状为(BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_block_ptr).to(tl.float32) # 加载b的块，形状为(BLOCK_SIZE_K, BLOCK_SIZE_N)
-        acc += tl.dot(a, b)  # 矩阵乘累加
-        # 前进指针到下一个K块
-        a_block_ptr = tl.advance(a_block_ptr, [0, BLOCK_SIZE_K])
-        b_block_ptr = tl.advance(b_block_ptr, [BLOCK_SIZE_K, 0])
-
-    # 如果启用bias，添加偏置
-    if HAS_BIAS:
-        # 计算bias的偏移和mask
-        col_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        bias_mask = col_offsets < N
-
-        # 直接使用指针偏移加载bias
-        bias_vals = tl.load(bias_ptr + col_offsets, mask=bias_mask, other=0.0).to(tl.float32)
-
-        # 将bias广播到整个块并加到累加器
-        acc += bias_vals[None, :]  # 广播到(BLOCK_SIZE_M, BLOCK_SIZE_N)
-
-    # 将结果存储到输出
-    tl.store(c_block_ptr, acc.to(c_ptr.dtype.element_ty))  # 转换类型以匹配输出
+        # 创建掩码以防止越界访问
+        x_mask = (rm[:, None] < M) & ((rk[None, :] + k_start) < K)
+        y_mask = ((rk[:, None] + k_start) < K) & (rn[None, :] < N)
+                                                                                                                                    
+        # 从全局内存加载数据块
+        x_chunk = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        y_chunk = tl.load(y_ptrs, mask=y_mask, other=0.0)
+                                                                                                                                                                    
+        # 计算矩阵乘法累加
+        acc += tl.dot(x_chunk, y_chunk, allow_tf32=False)
+                                                                                                                                                                                        
+    # 根据has_bias标志决定是否添加偏置
+    if has_bias:
+        # 加载偏置值（广播到所有行）
+        bias_ptrs = bias_ptr + rn * stride_bias        
+        bias_mask = rn < None        
+        bias_vals = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+        # 将偏置加到累加器上（自动广播）
+        acc += bias_vals[None, :]
+                                                                                                                                                                                                                                        
+    # 计算输出指针位置
+    out_ptrs = output_ptr + rm[:, None] * stride_outm + rn[None, :] * stride_outn    
+    out_mask = (rm[:, None] < M) & (rn[None, :] < N)
+                                                                                                                                                                                                                                                    
+    # 将结果存储到全局内存
+    tl.store(out_ptrs, acc, mask=out_mask)
 
 
-def matmul_persistent(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+def matmul_persistent(x, y, bias=None):
     """
-    使用Triton实现矩阵乘并可选添加偏置。
+    使用Triton实现矩阵乘法加可选偏置: x @ y + bias (如果bias不为None)
+                
     参数:
-        x: 输入矩阵，形状为(M, K)
-        y: 输入矩阵，形状为(K, N)
-        bias: 可选偏置向量，形状为(N,)。如果为None，则不添加偏置。
+        x: torch.Tensor, 形状为 [M, K]
+        y: torch.Tensor, 形状为 [K, N] 
+        bias: torch.Tensor, 形状为 [N] 或 None
+                                                
     返回:
-        输出矩阵，形状为(M, N)
+        output: torch.Tensor, 形状为 [M, N]
     """
-    assert x.dim() == 2 and y.dim() == 2, "输入必须是2D张量"
-    assert x.shape[1] == y.shape[0], f"x的列数({x.shape[1]})必须等于y的行数({y.shape[0]})"
-    M, K = x.shape
-    _, N = y.shape
-    # 分配输出张量（与x同设备同数据类型）
-    c = torch.empty((M, N), device=x.device, dtype=x.dtype)
-
-    # 设置块大小（必须为2的幂，Triton的约束）
-    # BLOCK_SIZE_M = 128
-    # BLOCK_SIZE_N = 128
-    # BLOCK_SIZE_K = 128
-    BLOCK_SIZE_M = min(triton.next_power_of_2(M) // 2, 16)
-    BLOCK_SIZE_N = min(triton.next_power_of_2(N) // 2, 16)
-    BLOCK_SIZE_K = min(triton.next_power_of_2(K) // 2, 16)
-
-    # 计算网格大小（每个输出块一个程序实例）
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
-
-    # 获取张量的步长（假设张量是连续的）
-    stride_am, stride_ak = x.stride() if x.is_contiguous() else (x.stride(0), x.stride(1))
-    stride_bk, stride_bn = y.stride() if y.is_contiguous() else (y.stride(0), y.stride(1))
-    stride_cm, stride_cn = c.stride()
-
-    # 处理bias参数
+    # 验证输入形状
+    assert x.dim() == 2, "x必须是2D张量"
+    assert y.dim() == 2, "y必须是2D张量" 
+    assert x.shape[1] == y.shape[0], f"矩阵维度不匹配: x.shape[1]={x.shape[1]}, y.shape[0]={y.shape[0]}"
+                                                                                    
+    M, K = x.shape    
+    _, N = y.shape    
+    # 验证bias形状（如果不为None）
     if bias is not None:
-        assert bias.dim() == 1 and bias.shape[0] == N, f"bias必须是形状为({N},)的向量，但得到{bias.shape}"
-        bias_ptr = bias
-        stride_bias = bias.stride(0)  # 对于向量，通常为1
-        HAS_BIAS = True
+        assert bias.dim() == 1, "bias必须是1D张量"
+        assert y.shape[1] == bias.shape[0], f"偏置维度不匹配: y.shape[1]={y.shape[1]}, bias.shape[0]={bias.shape[0]}"
+                                                                                                                        
+    # 分配输出张量（与x相同的数据类型）
+    output = torch.empty((M, N), dtype=x.dtype, device=x.device)
+                                                                                                                                    
+    # 定义分块大小（可根据硬件调整）
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128
+                                                                                                                                                
+    # 计算网格大小（每个分块一个线程）
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+                                                                                                                                                            
+    # 处理bias为None的情况
+    if bias is None:
+        # 创建一个虚拟的bias张量（不会被使用，因为has_bias=False）
+        dummy_bias = torch.empty(0, dtype=x.dtype, device=x.device)
+        has_bias = False
+        bias_stride = 0
+        bias_to_pass = dummy_bias    
     else:
-        # 如果bias为None，传递一个虚拟指针（不会实际使用，因为HAS_BIAS=False）
-        bias_ptr = x  # 任意有效指针
-        stride_bias = 1  # 虚拟值
-        HAS_BIAS = False
-    # 启动Triton内核
+        has_bias = True
+        bias_stride = bias.stride(0)
+        bias_to_pass = bias    
+    # 启动kernel
     matmul_bias_persistent_kernel[grid](
-        a_ptr=x,
-        b_ptr=y,
-        bias_ptr=bias_ptr,
-        c_ptr=c,
-        M=M, N=N, K=K,
-        stride_am=stride_am, stride_ak=stride_ak,
-        stride_bk=stride_bk, stride_bn=stride_bn,
-        stride_cm=stride_cm, stride_cn=stride_cn,
-        stride_bias=stride_bias,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        HAS_BIAS=HAS_BIAS,
+        x, y, bias_to_pass, output,           # 输入输出张量
+        M, N, K,                              # 矩阵维度
+        x.stride(0), x.stride(1),             # x的步长
+        y.stride(0), y.stride(1),             # y的步长  
+        bias_stride,                          # bias的步长（如果bias为None则为0）
+        output.stride(0), output.stride(1),   # 输出的步长
+        has_bias,                             # 是否使用偏置的标志
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
-
-    ref_c = torch.matmul(x, y)
-    if (not torch.allclose(c, ref_c, atol=1e-3, rtol=1e-3)):
-        print("!!!!!!!!!!!!!!!!!!!")
-        print(x.shape)
-        print(y.shape)
-
-    return c
+                                                                                                                                                                                                                                                    
+    return output
 
 
 def mm_batch_invariant(a, b):
