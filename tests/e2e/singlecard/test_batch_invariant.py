@@ -980,3 +980,254 @@ def test_decode_logprobs_match_prefill_logprobs(
     else:
         print("✓ SUCCESS: All decode logprobs match prefill logprobs bitwise!")
         print(f"{'=' * 80}\n")
+
+
+# ============================================================================
+# Flash Attention with KVCache - Batch Invariance Tests
+# ============================================================================
+
+def test_flash_attn_kvcache_basic_batch_invariance():
+    """
+    测试基础的批不变性：
+    flash_attn_with_kvcache(q[:1], k_cache[:1], v_cache[:1])
+    == flash_attn_with_kvcache(q, k_cache, v_cache)[:1]
+
+    不使用新的 KV、GQA、causal masking 等特性
+    """
+    import torch
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+
+    # 设置随机种子
+    torch.manual_seed(42)
+
+    # 简单场景参数
+    batch = 8
+    seqlen_q = 1
+    seqlen_cache = 128
+    nheads = 32
+    headdim = 128
+
+    # 创建测试数据（使用 CPU 进行测试，因为可能没有 NPU 环境）
+    device = 'cpu'
+    dtype = torch.float32  # 使用 float32 以确保精度
+
+    q = torch.randn(batch, seqlen_q, nheads, headdim, dtype=dtype, device=device)
+    k_cache = torch.randn(batch, seqlen_cache, nheads, headdim, dtype=dtype, device=device)
+    v_cache = torch.randn(batch, seqlen_cache, nheads, headdim, dtype=dtype, device=device)
+
+    print(f"\n{'=' * 80}")
+    print("测试基础批不变性（无新 KV，无 GQA，无 causal）")
+    print(f"批次大小: {batch}, 序列长度: {seqlen_q}, 缓存长度: {seqlen_cache}")
+    print(f"头数: {nheads}, 头维度: {headdim}")
+    print(f"{'=' * 80}\n")
+
+    # 方法 1：只处理第一个批次
+    out1 = flash_attn_with_kvcache_batch_invariant(
+        q[:1], k_cache[:1], v_cache[:1]
+    )
+
+    # 方法 2：处理全部批次，然后切片
+    out2 = flash_attn_with_kvcache_batch_invariant(
+        q, k_cache, v_cache
+    )[:1]
+
+    # 验证形状
+    assert out1.shape == out2.shape, f"形状不匹配: {out1.shape} vs {out2.shape}"
+    assert out1.shape == (1, seqlen_q, nheads, headdim), f"输出形状错误: {out1.shape}"
+
+    # 验证批不变性（bitwise 比较）
+    if torch.equal(out1, out2):
+        print("✓ 批不变性测试通过！（bitwise 完全一致）")
+    else:
+        # 计算数值差异
+        diff = (out1 - out2).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+
+        print(f"✗ 批不变性测试失败！")
+        print(f"  最大差异: {max_diff}")
+        print(f"  平均差异: {mean_diff}")
+        print(f"  相对误差: {max_diff / (out1.abs().max().item() + 1e-10)}")
+
+        # 如果差异非常小，可能是数值精度问题
+        if max_diff < 1e-5:
+            print(f"  注意：差异非常小（< 1e-5），可能是数值精度导致")
+            print(f"  在实际应用中可能可以接受")
+
+        pytest.fail(f"批不变性测试失败，最大差异: {max_diff}")
+
+    print(f"{'=' * 80}\n")
+
+
+def test_flash_attn_kvcache_with_new_kv_batch_invariance():
+    """
+    测试带有新 KV 更新的批不变性
+    """
+    import torch
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+
+    torch.manual_seed(42)
+
+    batch = 4
+    seqlen_q = 1
+    seqlen_cache = 64
+    seqlen_new = 8
+    nheads = 16
+    headdim = 64
+
+    device = 'cpu'
+    dtype = torch.float32
+
+    q = torch.randn(batch, seqlen_q, nheads, headdim, dtype=dtype, device=device)
+    k_cache = torch.randn(batch, seqlen_cache, nheads, headdim, dtype=dtype, device=device)
+    v_cache = torch.randn(batch, seqlen_cache, nheads, headdim, dtype=dtype, device=device)
+    k_new = torch.randn(batch, seqlen_new, nheads, headdim, dtype=dtype, device=device)
+    v_new = torch.randn(batch, seqlen_new, nheads, headdim, dtype=dtype, device=device)
+
+    print(f"\n{'=' * 80}")
+    print("测试带有新 KV 更新的批不变性")
+    print(f"批次大小: {batch}, 新 KV 长度: {seqlen_new}")
+    print(f"{'=' * 80}\n")
+
+    # 为每个测试创建独立的 cache 副本（避免原地修改影响）
+    k_cache1 = k_cache[:1].clone()
+    v_cache1 = v_cache[:1].clone()
+    k_cache_full = k_cache.clone()
+    v_cache_full = v_cache.clone()
+
+    # 方法 1：batch_size = 1 with new KV
+    out1 = flash_attn_with_kvcache_batch_invariant(
+        q[:1], k_cache1, v_cache1,
+        k=k_new[:1], v=v_new[:1]
+    )
+
+    # 方法 2：batch_size = batch with new KV
+    out2 = flash_attn_with_kvcache_batch_invariant(
+        q, k_cache_full, v_cache_full,
+        k=k_new, v=v_new
+    )[:1]
+
+    # 验证批不变性
+    if torch.equal(out1, out2):
+        print("✓ 带新 KV 的批不变性测试通过！")
+    else:
+        diff = (out1 - out2).abs()
+        max_diff = diff.max().item()
+        print(f"✗ 带新 KV 的批不变性测试失败，最大差异: {max_diff}")
+
+        if max_diff < 1e-5:
+            print(f"  差异非常小（< 1e-5），可能可以接受")
+
+        pytest.fail(f"批不变性测试失败，最大差异: {max_diff}")
+
+    print(f"{'=' * 80}\n")
+
+
+def test_flash_attn_kvcache_with_causal_batch_invariance():
+    """
+    测试 causal masking 下的批不变性
+    """
+    import torch
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+
+    torch.manual_seed(42)
+
+    batch = 4
+    seqlen_q = 8
+    seqlen_cache = 64
+    nheads = 8
+    headdim = 64
+
+    device = 'cpu'
+    dtype = torch.float32
+
+    q = torch.randn(batch, seqlen_q, nheads, headdim, dtype=dtype, device=device)
+    k_cache = torch.randn(batch, seqlen_cache, nheads, headdim, dtype=dtype, device=device)
+    v_cache = torch.randn(batch, seqlen_cache, nheads, headdim, dtype=dtype, device=device)
+
+    print(f"\n{'=' * 80}")
+    print("测试 Causal Masking 的批不变性")
+    print(f"批次大小: {batch}, Query 长度: {seqlen_q}")
+    print(f"{'=' * 80}\n")
+
+    # 方法 1：batch_size = 1 with causal
+    out1 = flash_attn_with_kvcache_batch_invariant(
+        q[:1], k_cache[:1], v_cache[:1],
+        causal=True
+    )
+
+    # 方法 2：batch_size = batch with causal
+    out2 = flash_attn_with_kvcache_batch_invariant(
+        q, k_cache, v_cache,
+        causal=True
+    )[:1]
+
+    # 验证批不变性
+    if torch.equal(out1, out2):
+        print("✓ Causal masking 批不变性测试通过！")
+    else:
+        diff = (out1 - out2).abs()
+        max_diff = diff.max().item()
+        print(f"✗ Causal masking 批不变性测试失败，最大差异: {max_diff}")
+
+        if max_diff < 1e-5:
+            print(f"  差异非常小（< 1e-5），可能可以接受")
+
+        pytest.fail(f"批不变性测试失败，最大差异: {max_diff}")
+
+    print(f"{'=' * 80}\n")
+
+
+def test_flash_attn_kvcache_with_gqa_batch_invariance():
+    """
+    测试 GQA（Grouped Query Attention）的批不变性
+    """
+    import torch
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+
+    torch.manual_seed(42)
+
+    batch = 4
+    seqlen_q = 1
+    seqlen_cache = 64
+    nheads_q = 32  # Query heads
+    nheads_kv = 8  # KV heads (GQA: 4 queries per KV head)
+    headdim = 64
+
+    device = 'cpu'
+    dtype = torch.float32
+
+    q = torch.randn(batch, seqlen_q, nheads_q, headdim, dtype=dtype, device=device)
+    k_cache = torch.randn(batch, seqlen_cache, nheads_kv, headdim, dtype=dtype, device=device)
+    v_cache = torch.randn(batch, seqlen_cache, nheads_kv, headdim, dtype=dtype, device=device)
+
+    print(f"\n{'=' * 80}")
+    print("测试 GQA 的批不变性")
+    print(f"批次大小: {batch}, Q heads: {nheads_q}, KV heads: {nheads_kv}")
+    print(f"Group size: {nheads_q // nheads_kv}")
+    print(f"{'=' * 80}\n")
+
+    # 方法 1：batch_size = 1 with GQA
+    out1 = flash_attn_with_kvcache_batch_invariant(
+        q[:1], k_cache[:1], v_cache[:1]
+    )
+
+    # 方法 2：batch_size = batch with GQA
+    out2 = flash_attn_with_kvcache_batch_invariant(
+        q, k_cache, v_cache
+    )[:1]
+
+    # 验证批不变性
+    if torch.equal(out1, out2):
+        print("✓ GQA 批不变性测试通过！")
+    else:
+        diff = (out1 - out2).abs()
+        max_diff = diff.max().item()
+        print(f"✗ GQA 批不变性测试失败，最大差异: {max_diff}")
+
+        if max_diff < 1e-5:
+            print(f"  差异非常小（< 1e-5），可能可以接受")
+
+        pytest.fail(f"批不变性测试失败，最大差异: {max_diff}")
+
+    print(f"{'=' * 80}\n")

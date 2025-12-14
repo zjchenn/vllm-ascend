@@ -566,3 +566,370 @@ def init_batch_invariance():
     if vllm_is_batch_invariant():
         override_envs_for_invariance()
         enable_batch_invariant_mode()
+
+
+# ============================================================================
+# Flash Attention with KVCache - Batch Invariant Implementation
+# ============================================================================
+
+@triton.jit
+def _flash_attn_kvcache_batch_invariant_kernel(
+    # 输入输出指针
+    Q, K_cache, V_cache, Out,
+    K_new, V_new,
+    Cache_seqlens, Cache_batch_idx,
+    # Q 的步长
+    stride_qz, stride_qm, stride_qh, stride_qd,
+    # K cache 的步长
+    stride_kz, stride_kn, stride_kh, stride_kd,
+    # V cache 的步长
+    stride_vz, stride_vn, stride_vh, stride_vd,
+    # Output 的步长
+    stride_oz, stride_om, stride_oh, stride_od,
+    # K new 的步长（如果有新 KV）
+    stride_knz, stride_knn, stride_knh, stride_knd,
+    # V new 的步长（如果有新 KV）
+    stride_vnz, stride_vnn, stride_vnh, stride_vnd,
+    # 维度参数
+    Z, N_CTX_Q, N_CTX_K, N_CTX_NEW,
+    H_q, H_kv, HEADDIM,
+    sm_scale,
+    # 编译时常量
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    USE_CACHE_SEQLENS: tl.constexpr,
+    USE_CACHE_BATCH_IDX: tl.constexpr,
+    NEW_KV: tl.constexpr,
+    IS_GQA: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    """
+    批不变性的 Flash Attention with KVCache Triton Kernel
+
+    关键设计：
+    1. 不使用 Split-K 并行，串行遍历所有 K/V 块
+    2. Float32 累加，确保精度
+    3. 禁用 TF32（通过 allow_tf32=False）
+    4. 固定的遍历顺序
+    5. 串行 KV 更新（只有 pid_m==0 的块负责）
+    """
+    # 获取程序 ID
+    pid_m = tl.program_id(0)  # Query 块 ID
+    pid_zh = tl.program_id(1)  # Batch * Heads 的组合 ID
+
+    # 分解 batch 和 head 索引
+    z_id = pid_zh // H_q
+    hq_id = pid_zh % H_q
+
+    # GQA: 计算对应的 KV head
+    if IS_GQA:
+        hk_id = hq_id // GROUP_SIZE
+        hv_id = hk_id
+    else:
+        hk_id = hq_id
+        hv_id = hq_id
+
+    # 确定实际的 KV 序列长度
+    if USE_CACHE_SEQLENS:
+        cache_seqlen = tl.load(Cache_seqlens + z_id)
+        if NEW_KV:
+            N_CTX_K_FINAL = cache_seqlen + N_CTX_NEW
+        else:
+            N_CTX_K_FINAL = cache_seqlen
+    else:
+        N_CTX_K_FINAL = N_CTX_K
+
+    # 确定 batch 索引映射
+    if USE_CACHE_BATCH_IDX:
+        cache_batch_idx = tl.load(Cache_batch_idx + z_id)
+    else:
+        cache_batch_idx = z_id
+
+    # 计算偏移量
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+
+    # Q 指针
+    q_offset = Q + z_id * stride_qz + hq_id * stride_qh
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+
+    # K/V Cache 指针
+    k_offset = K_cache + cache_batch_idx * stride_kz + hk_id * stride_kh
+    v_offset = V_cache + cache_batch_idx * stride_vz + hv_id * stride_vh
+
+    # 创建掩码
+    q_mask = (offs_m[:, None] < N_CTX_Q) & (offs_d[None, :] < HEADDIM)
+
+    # 加载 Q（保持在 SRAM）
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+
+    # 缩放 Q（使用 log2(e) 优化）
+    qk_scale = sm_scale * 1.44269504
+    q = (q * qk_scale).to(q.dtype)
+
+    # === KV Cache 更新（批不变性关键：串行更新）===
+    # 只有 pid_m == 0 的线程块负责更新，避免并发写入
+    if NEW_KV and pid_m == 0:
+        knew_base = K_new + z_id * stride_knz + hk_id * stride_knh
+        vnew_base = V_new + z_id * stride_vnz + hv_id * stride_vnh
+
+        # 确定起始位置
+        if USE_CACHE_SEQLENS:
+            start_idx = tl.load(Cache_seqlens + z_id)
+        else:
+            start_idx = N_CTX_K - N_CTX_NEW
+
+        # 逐块复制新的 K
+        for i in range(0, N_CTX_NEW, BLOCK_N):
+            k_new_block = tl.load(
+                knew_base +
+                offs_d[:, None] * stride_knd +
+                (offs_n[None, :] + i) * stride_knn,
+                mask=(offs_d[:, None] < HEADDIM) & ((offs_n[None, :] + i) < N_CTX_NEW),
+                other=0.0
+            )
+            tl.store(
+                k_offset +
+                offs_d[:, None] * stride_kd +
+                (offs_n[None, :] + i + start_idx) * stride_kn,
+                k_new_block,
+                mask=(offs_d[:, None] < HEADDIM) & ((offs_n[None, :] + i) < N_CTX_NEW)
+            )
+
+        # 逐块复制新的 V
+        for i in range(0, N_CTX_NEW, BLOCK_N):
+            v_new_block = tl.load(
+                vnew_base +
+                (offs_n[:, None] + i) * stride_vnn +
+                offs_d[None, :] * stride_vnd,
+                mask=((offs_n[:, None] + i) < N_CTX_NEW) & (offs_d[None, :] < HEADDIM),
+                other=0.0
+            )
+            tl.store(
+                v_offset +
+                (offs_n[:, None] + i + start_idx) * stride_vn +
+                offs_d[None, :] * stride_vd,
+                v_new_block,
+                mask=((offs_n[:, None] + i) < N_CTX_NEW) & (offs_d[None, :] < HEADDIM)
+            )
+
+    # === Online Softmax Attention（批不变性关键：固定顺序）===
+
+    # 初始化累加器（在 float32 中累加）
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+    # 批不变性关键：固定顺序遍历，不使用 Split-K
+    # 所有批次以相同的顺序访问 K/V 块
+    for start_n in range(0, N_CTX_K_FINAL, BLOCK_N):
+        # 计算当前块的实际大小
+        curr_n_end = tl.minimum(start_n + BLOCK_N, N_CTX_K_FINAL)
+
+        # 加载 K^T 块
+        kT_ptrs = k_offset + offs_d[:, None] * stride_kd + (start_n + offs_n)[None, :] * stride_kn
+        kT_mask = (offs_d[:, None] < HEADDIM) & ((start_n + offs_n)[None, :] < N_CTX_K_FINAL)
+        kT = tl.load(kT_ptrs, mask=kT_mask, other=0.0)
+
+        # 加载 V 块
+        v_ptrs = v_offset + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd
+        v_mask = ((start_n + offs_n)[:, None] < N_CTX_K_FINAL) & (offs_d[None, :] < HEADDIM)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+
+        # 计算 QK^T（批不变性关键：禁用 TF32）
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, kT, allow_tf32=False)
+
+        # 应用 Causal Mask
+        if IS_CAUSAL:
+            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            col_idx = start_n + tl.arange(0, BLOCK_N)
+            # 创建 N_CTX_Q x N_CTX_K_FINAL 的因果掩码
+            col_offset = N_CTX_Q - N_CTX_K_FINAL
+            causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
+            qk = tl.where(causal_mask, qk, float("-inf"))
+
+        # 边界掩码
+        boundary_mask = (start_n + offs_n)[None, :] < N_CTX_K_FINAL
+        qk = tl.where(boundary_mask, qk, float("-inf"))
+
+        # Online Softmax（批不变性关键：精确控制累加顺序）
+        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+
+        # 计算 alpha（重缩放因子）
+        if IS_CAUSAL:
+            alpha = tl.math.exp2(tl.where(m_i > float("-inf"), m_i - m_i_new, float("-inf")))
+        else:
+            alpha = tl.math.exp2(m_i - m_i_new)
+
+        # 计算 P = exp2(QK - m_new)
+        if IS_CAUSAL:
+            qk = tl.where(qk > float("-inf"), qk - m_i_new[:, None], float("-inf"))
+        else:
+            qk = qk - m_i_new[:, None]
+
+        p = tl.math.exp2(qk)
+
+        # 更新 l_i 和 m_i
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_i_new
+
+        # 转换 P 的类型
+        p = p.to(q.dtype)
+
+        # 重缩放累加器并累加新值（批不变性关键：在 float32 中累加）
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32), allow_tf32=False)
+
+    # === 最终归一化 ===
+    # 避免除零
+    l_i_safe = tl.where(l_i > 0, l_i, 1.0)
+    acc = acc / l_i_safe[:, None]
+
+    # 转换回输出类型
+    acc = acc.to(Out.dtype.element_ty)
+
+    # 存储输出
+    out_ptrs = Out + z_id * stride_oz + hq_id * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+    out_mask = (offs_m[:, None] < N_CTX_Q) & (offs_d[None, :] < HEADDIM)
+    tl.store(out_ptrs, acc, mask=out_mask)
+
+
+def flash_attn_with_kvcache_batch_invariant(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """
+    批不变性版本的 Flash Attention with KVCache
+
+    确保：flash_attn_with_kvcache_batch_invariant(q[:1], k_cache[:1], v_cache[:1])
+         == flash_attn_with_kvcache_batch_invariant(q, k_cache, v_cache)[:1]
+
+    参数:
+        q: [batch, seqlen_q, nheads_q, headdim] - Query 张量
+        k_cache: [batch_cache, seqlen_cache, nheads_kv, headdim] - Key cache
+        v_cache: [batch_cache, seqlen_cache, nheads_kv, headdim] - Value cache
+        k: [batch, seqlen_new, nheads_kv, headdim] - 新的 Key（可选）
+        v: [batch, seqlen_new, nheads_kv, headdim] - 新的 Value（可选）
+        cache_seqlens: [batch] dtype=int32 - 每个样本的缓存序列长度（可选）
+        cache_batch_idx: [batch] dtype=int32 - 批次索引映射（可选）
+        softmax_scale: float - QK^T 的缩放因子，默认 1/sqrt(headdim)
+        causal: bool - 是否使用因果掩码
+
+    返回:
+        output: [batch, seqlen_q, nheads_q, headdim] - 输出张量
+
+    限制：
+        - 当前仅支持 split=1（不使用 Split-K 并行）
+        - 不支持 paged KVCache（无 block_table）
+        - Rotary embedding 应在外部处理
+    """
+    # 验证输入
+    assert q.dim() == 4, f"q 必须是 4D 张量 [batch, seqlen, nheads, headdim]，当前: {q.shape}"
+    assert k_cache.dim() == 4 and v_cache.dim() == 4, "k_cache 和 v_cache 必须是 4D 张量"
+
+    batch, seqlen_q, nheads_q, headdim = q.shape
+    batch_cache, seqlen_cache, nheads_kv, _ = k_cache.shape
+
+    # 验证 k_cache 和 v_cache 形状匹配
+    assert k_cache.shape == v_cache.shape, f"k_cache 和 v_cache 形状必须相同：{k_cache.shape} vs {v_cache.shape}"
+
+    # 计算 softmax_scale
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (headdim ** 0.5)
+
+    # 确定是否为 GQA
+    assert nheads_q % nheads_kv == 0, f"nheads_q ({nheads_q}) 必须能被 nheads_kv ({nheads_kv}) 整除"
+    group_size = nheads_q // nheads_kv
+    is_gqa = group_size > 1
+
+    # 处理新的 KV
+    is_new_kv = k is not None and v is not None
+    if is_new_kv:
+        assert k.shape == v.shape, f"k 和 v 形状必须相同：{k.shape} vs {v.shape}"
+        assert k.shape[0] == batch, f"k 的 batch 大小必须与 q 相同：{k.shape[0]} vs {batch}"
+        assert k.shape[2] == nheads_kv, f"k 的 nheads 必须与 k_cache 相同：{k.shape[2]} vs {nheads_kv}"
+        seqlen_new = k.shape[1]
+    else:
+        seqlen_new = 0
+        # 创建 dummy 张量以传递给 kernel
+        k = torch.empty((batch, 0, nheads_kv, headdim), dtype=q.dtype, device=q.device)
+        v = torch.empty((batch, 0, nheads_kv, headdim), dtype=q.dtype, device=q.device)
+
+    # 处理 cache_seqlens
+    use_cache_seqlens = cache_seqlens is not None
+    if not use_cache_seqlens:
+        cache_seqlens = torch.empty(0, dtype=torch.int32, device=q.device)
+    else:
+        if cache_seqlens.dtype != torch.int32:
+            cache_seqlens = cache_seqlens.to(torch.int32)
+
+    # 处理 cache_batch_idx
+    use_cache_batch_idx = cache_batch_idx is not None
+    if not use_cache_batch_idx:
+        cache_batch_idx = torch.empty(0, dtype=torch.int32, device=q.device)
+    else:
+        if cache_batch_idx.dtype != torch.int32:
+            cache_batch_idx = cache_batch_idx.to(torch.int32)
+
+    # 分配输出张量
+    output = torch.empty_like(q)
+
+    # 固定的块大小（批不变性的关键）
+    BLOCK_M = 16  # Query 块大小
+    BLOCK_N = 64  # Key/Value 块大小
+    BLOCK_DMODEL = triton.next_power_of_2(headdim)
+
+    # 计算网格大小
+    grid = (
+        triton.cdiv(seqlen_q, BLOCK_M),  # M 维度的块数
+        batch * nheads_q,                 # Batch * Heads
+    )
+
+    # 启动 kernel
+    _flash_attn_kvcache_batch_invariant_kernel[grid](
+        # 输入输出
+        q, k_cache, v_cache, output,
+        k, v,
+        cache_seqlens, cache_batch_idx,
+        # Q strides
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        # K cache strides
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        # V cache strides
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        # Output strides
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        # K new strides
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        # V new strides
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        # 维度
+        batch, seqlen_q, seqlen_cache, seqlen_new,
+        nheads_q, nheads_kv, headdim,
+        softmax_scale,
+        # 编译时常量
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        USE_CACHE_SEQLENS=use_cache_seqlens,
+        USE_CACHE_BATCH_IDX=use_cache_batch_idx,
+        NEW_KV=is_new_kv,
+        IS_GQA=is_gqa,
+        IS_CAUSAL=causal,
+        GROUP_SIZE=group_size,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    return output
