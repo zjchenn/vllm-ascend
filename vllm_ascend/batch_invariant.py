@@ -532,6 +532,14 @@ def enable_batch_invariant_mode():
     _original_torch_bmm = torch.bmm
     torch.bmm = bmm_batch_invariant
 
+    # Register flash attention batch invariant version
+    # Note: Flash attention is typically called by the attention backend,
+    # so we don't need to register it as a PyTorch operator.
+    # The attention backend should check VLLM_USE_BATCH_INVARIANT_ATTENTION
+    # environment variable and use flash_attn_with_kvcache_batch_invariant
+    # instead of the standard flash_attn_with_kvcache.
+
+
 
 
 @cache
@@ -546,9 +554,33 @@ def vllm_is_batch_invariant():
     return is_overridden
 
 
-def override_envs_for_invariance():
-    # TODO(Ronald) set attntion backend to deterministic mode
+@cache
+def use_batch_invariant_attention():
+    """
+    检查是否应该使用批不变性的 Flash Attention。
 
+    返回 True 如果满足以下任一条件：
+    1. VLLM_USE_BATCH_INVARIANT_ATTENTION=1
+    2. VLLM_BATCH_INVARIANT=1（全局批不变性模式）
+    """
+    # 检查专门的 flash attention 环境变量
+    fa_env = os.getenv("VLLM_USE_BATCH_INVARIANT_ATTENTION", None)
+    if fa_env is not None:
+        try:
+            return int(fa_env) != 0
+        except ValueError:
+            pass
+
+    # 回退到全局批不变性设置
+    return vllm_is_batch_invariant()
+
+
+def override_envs_for_invariance():
+    # Attention backend determinism settings
+    # Flash Attention will check use_batch_invariant_attention()
+    # to decide whether to use the batch invariant version
+    # Users can set VLLM_USE_BATCH_INVARIANT_ATTENTION=1 explicitly
+    # or rely on VLLM_BATCH_INVARIANT=1 (global setting)
 
     # communication determinism settings
     os.environ["HCCL_DETERMINISTIC"] = "true"
@@ -804,36 +836,134 @@ def flash_attn_with_kvcache_batch_invariant(
     v_cache: torch.Tensor,
     k: torch.Tensor | None = None,
     v: torch.Tensor | None = None,
-    cache_seqlens: torch.Tensor | None = None,
+    qv: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    cache_seqlens: int | torch.Tensor | None = None,
     cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    rotary_seqlens: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
-) -> torch.Tensor:
+    window_size: tuple = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    scheduler_metadata=None,
+    num_splits: int = 0,
+    pack_gqa: bool | None = None,
+    sm_margin: int = 0,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple:
     """
-    批不变性版本的 Flash Attention with KVCache
+    批不变性版本的 Flash Attention with KVCache（Hopper 接口）
 
-    确保：flash_attn_with_kvcache_batch_invariant(q[:1], k_cache[:1], v_cache[:1])
-         == flash_attn_with_kvcache_batch_invariant(q, k_cache, v_cache)[:1]
+    与 flash-attention/hopper/flash_attn_interface.py:928 的 flash_attn_with_kvcache 接口对齐。
+
+    确保批不变性：
+    flash_attn_with_kvcache_batch_invariant(q[:1], k_cache[:1], v_cache[:1])
+    == flash_attn_with_kvcache_batch_invariant(q, k_cache, v_cache)[:1]
+
+    通过以下方式保证批不变性：
+    1. 串行 K/V 遍历（无 Split-K 并行）
+    2. Float32 累加确保精度
+    3. 禁用 TF32（allow_tf32=False）
+    4. 固定的遍历顺序
 
     参数:
-        q: [batch, seqlen_q, nheads_q, headdim] - Query 张量
-        k_cache: [batch_cache, seqlen_cache, nheads_kv, headdim] - Key cache
-        v_cache: [batch_cache, seqlen_cache, nheads_kv, headdim] - Value cache
-        k: [batch, seqlen_new, nheads_kv, headdim] - 新的 Key（可选）
-        v: [batch, seqlen_new, nheads_kv, headdim] - 新的 Value（可选）
-        cache_seqlens: [batch] dtype=int32 - 每个样本的缓存序列长度（可选）
-        cache_batch_idx: [batch] dtype=int32 - 批次索引映射（可选）
+        q: (batch_size, seqlen, nheads, headdim) - Query 张量
+        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) - Key cache
+                 或 (num_blocks, page_block_size, nheads_k, headdim) 如果使用 page_table
+        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) - Value cache
+                 或 (num_blocks, page_block_size, nheads_k, headdim_v) 如果使用 page_table
+        k [optional]: (batch_size, seqlen_new, nheads_k, headdim) - 新的 Key
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v) - 新的 Value
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v) - Query for value（暂不支持）
+        rotary_cos [optional]: (seqlen_ro, rotary_dim / 2) - Rotary embedding cos（暂不支持）
+        rotary_sin [optional]: (seqlen_ro, rotary_dim / 2) - Rotary embedding sin（暂不支持）
+        cache_seqlens: int or (batch_size,) dtype=int32 - KV cache 序列长度
+        cache_batch_idx: (batch_size,) dtype=int32 - 批次索引映射
+        cache_leftpad: (batch_size,) dtype=int32 - KV cache 起始索引（暂不支持）
+        page_table [optional]: (batch_size, max_num_blocks_per_seq) dtype=int32 - Paged KV cache（暂不支持）
+        cu_seqlens_q [optional]: 累积序列长度（varlen）（暂不支持）
+        cu_seqlens_k_new [optional]: 新 K 的累积序列长度（暂不支持）
+        max_seqlen_q [optional]: 最大 query 序列长度（暂不支持）
+        rotary_seqlens [optional]: Rotary embedding 序列长度（暂不支持）
+        q_descale [optional]: FP8 量化的 descale 因子（暂不支持）
+        k_descale [optional]: FP8 量化的 descale 因子（暂不支持）
+        v_descale [optional]: FP8 量化的 descale 因子（暂不支持）
         softmax_scale: float - QK^T 的缩放因子，默认 1/sqrt(headdim)
         causal: bool - 是否使用因果掩码
+        window_size: (left, right) - 滑动窗口（暂不支持）
+        attention_chunk: int - Attention chunk size（暂不支持）
+        softcap: float - Softcapping attention（暂不支持）
+        rotary_interleaved: bool - Rotary embedding 模式（暂不支持）
+        scheduler_metadata: Scheduler metadata（暂不支持）
+        num_splits: int - Split-K 数量（批不变性版本固定为1）
+        pack_gqa: bool - 是否 pack GQA（暂不支持）
+        sm_margin: int - SM margin for communication（暂不支持）
+        return_softmax_lse: bool - 是否返回 log-sum-exp
 
     返回:
-        output: [batch, seqlen_q, nheads_q, headdim] - 输出张量
+        output: (batch_size, seqlen, nheads, headdim) - 输出张量
+        或 (output, softmax_lse) 如果 return_softmax_lse=True
+            softmax_lse: (batch_size, nheads, seqlen)
 
-    限制：
-        - 当前仅支持 split=1（不使用 Split-K 并行）
-        - 不支持 paged KVCache（无 block_table）
-        - Rotary embedding 应在外部处理
+    限制（MVP 版本）:
+        - 不支持 qv
+        - 不支持 rotary_cos/rotary_sin（rotary embedding 应在外部处理）
+        - 不支持 page_table（paged KV cache）
+        - 不支持 cache_leftpad
+        - 不支持 cu_seqlens_q/cu_seqlens_k_new（varlen）
+        - 不支持 window_size（滑动窗口）
+        - 不支持 attention_chunk
+        - 不支持 softcap
+        - 不支持 FP8 量化（q_descale/k_descale/v_descale）
+        - 不支持 scheduler_metadata
+        - 不支持 pack_gqa
+        - 不支持 sm_margin
+        - num_splits 固定为 1（无 Split-K）
+        - return_softmax_lse 暂返回 None
     """
+    # 验证不支持的参数
+    if qv is not None:
+        raise NotImplementedError("qv not supported in batch_invariant version yet")
+    if rotary_cos is not None or rotary_sin is not None:
+        raise NotImplementedError("Rotary embedding not supported in batch_invariant version yet")
+    if page_table is not None:
+        raise NotImplementedError("Paged KV cache (page_table) not supported in batch_invariant version yet")
+    if cache_leftpad is not None:
+        raise NotImplementedError("cache_leftpad not supported in batch_invariant version yet")
+    if cu_seqlens_q is not None or cu_seqlens_k_new is not None:
+        raise NotImplementedError("Variable-length sequences (cu_seqlens) not supported in batch_invariant version yet")
+    if max_seqlen_q is not None:
+        raise NotImplementedError("max_seqlen_q not supported in batch_invariant version yet")
+    if rotary_seqlens is not None:
+        raise NotImplementedError("rotary_seqlens not supported in batch_invariant version yet")
+    if q_descale is not None or k_descale is not None or v_descale is not None:
+        raise NotImplementedError("FP8 quantization (descale) not supported in batch_invariant version yet")
+    if window_size != (-1, -1):
+        raise NotImplementedError("Sliding window attention not supported in batch_invariant version yet")
+    if attention_chunk != 0:
+        raise NotImplementedError("attention_chunk not supported in batch_invariant version yet")
+    if softcap != 0.0:
+        raise NotImplementedError("Softcap not supported in batch_invariant version yet")
+    if scheduler_metadata is not None:
+        raise NotImplementedError("scheduler_metadata not supported in batch_invariant version yet")
+    if pack_gqa is not None:
+        raise NotImplementedError("pack_gqa not supported in batch_invariant version yet")
+    if sm_margin != 0:
+        raise NotImplementedError("sm_margin not supported in batch_invariant version yet")
+    if num_splits != 0 and num_splits != 1:
+        raise ValueError(f"Batch-invariant version only supports num_splits=0 or 1, got {num_splits}")
+
     # 验证输入
     assert q.dim() == 4, f"q 必须是 4D 张量 [batch, seqlen, nheads, headdim]，当前: {q.shape}"
     assert k_cache.dim() == 4 and v_cache.dim() == 4, "k_cache 和 v_cache 必须是 4D 张量"
@@ -843,6 +973,12 @@ def flash_attn_with_kvcache_batch_invariant(
 
     # 验证 k_cache 和 v_cache 形状匹配
     assert k_cache.shape == v_cache.shape, f"k_cache 和 v_cache 形状必须相同：{k_cache.shape} vs {v_cache.shape}"
+
+    # 处理 cache_seqlens（可以是 int 或 Tensor）
+    if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (batch,), cache_seqlens, dtype=torch.int32, device=k_cache.device
+        )
 
     # 计算 softmax_scale
     if softmax_scale is None:
@@ -932,4 +1068,12 @@ def flash_attn_with_kvcache_batch_invariant(
         num_stages=1,
     )
 
-    return output
+    # TODO: 实现 softmax_lse 计算
+    # 当前kernel不输出lse，如果需要可以在kernel中添加lse输出
+    if return_softmax_lse:
+        # softmax_lse shape: (batch, nheads, seqlen)
+        # 暂时返回None作为占位符
+        softmax_lse = None
+        return output, softmax_lse
+    else:
+        return output
