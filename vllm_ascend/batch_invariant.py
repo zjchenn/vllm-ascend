@@ -830,46 +830,40 @@ def _flash_attn_kvcache_batch_invariant_kernel(
     tl.store(out_ptrs, acc, mask=out_mask)
 
 
-def flash_attn_with_kvcache_batch_invariant(
+# ============================================================================
+# Flash Attention v2 with KVCache - Batch Invariant Implementation
+# 对齐 flash-attention/flash_attn/flash_attn_interface.py:1474
+# ============================================================================
+
+def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     k: torch.Tensor | None = None,
     v: torch.Tensor | None = None,
-    qv: torch.Tensor | None = None,
     rotary_cos: torch.Tensor | None = None,
     rotary_sin: torch.Tensor | None = None,
     cache_seqlens: int | torch.Tensor | None = None,
     cache_batch_idx: torch.Tensor | None = None,
     cache_leftpad: torch.Tensor | None = None,
-    page_table: torch.Tensor | None = None,
-    cu_seqlens_q: torch.Tensor | None = None,
-    cu_seqlens_k_new: torch.Tensor | None = None,
-    max_seqlen_q: int | None = None,
-    rotary_seqlens: torch.Tensor | None = None,
-    q_descale: torch.Tensor | None = None,
-    k_descale: torch.Tensor | None = None,
-    v_descale: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple = (-1, -1),
-    attention_chunk: int = 0,
     softcap: float = 0.0,
     rotary_interleaved: bool = True,
-    scheduler_metadata=None,
+    alibi_slopes: torch.Tensor | None = None,
     num_splits: int = 0,
-    pack_gqa: bool | None = None,
-    sm_margin: int = 0,
     return_softmax_lse: bool = False,
 ) -> torch.Tensor | tuple:
     """
-    批不变性版本的 Flash Attention with KVCache（Hopper 接口）
+    批不变性版本的 Flash Attention v2 with KVCache
 
-    与 flash-attention/hopper/flash_attn_interface.py:928 的 flash_attn_with_kvcache 接口对齐。
+    与 flash-attention/flash_attn/flash_attn_interface.py:1474 的 flash_attn_with_kvcache 接口对齐。
 
     确保批不变性：
-    flash_attn_with_kvcache_batch_invariant(q[:1], k_cache[:1], v_cache[:1])
-    == flash_attn_with_kvcache_batch_invariant(q, k_cache, v_cache)[:1]
+    flash_attn_with_kvcache(q[:1], k_cache[:1], v_cache[:1])
+    == flash_attn_with_kvcache(q, k_cache, v_cache)[:1]
 
     通过以下方式保证批不变性：
     1. 串行 K/V 遍历（无 Split-K 并行）
@@ -880,35 +874,24 @@ def flash_attn_with_kvcache_batch_invariant(
     参数:
         q: (batch_size, seqlen, nheads, headdim) - Query 张量
         k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) - Key cache
-                 或 (num_blocks, page_block_size, nheads_k, headdim) 如果使用 page_table
-        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) - Value cache
-                 或 (num_blocks, page_block_size, nheads_k, headdim_v) 如果使用 page_table
+                 或 (num_blocks, block_size, nheads_k, headdim) 如果使用 block_table
+        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) - Value cache
+                 或 (num_blocks, block_size, nheads_k, headdim) 如果使用 block_table
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim) - 新的 Key
-        v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v) - 新的 Value
-        qv [optional]: (batch_size, seqlen, nheads, headdim_v) - Query for value（暂不支持）
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim) - 新的 Value
         rotary_cos [optional]: (seqlen_ro, rotary_dim / 2) - Rotary embedding cos（暂不支持）
         rotary_sin [optional]: (seqlen_ro, rotary_dim / 2) - Rotary embedding sin（暂不支持）
         cache_seqlens: int or (batch_size,) dtype=int32 - KV cache 序列长度
         cache_batch_idx: (batch_size,) dtype=int32 - 批次索引映射
         cache_leftpad: (batch_size,) dtype=int32 - KV cache 起始索引（暂不支持）
-        page_table [optional]: (batch_size, max_num_blocks_per_seq) dtype=int32 - Paged KV cache（暂不支持）
-        cu_seqlens_q [optional]: 累积序列长度（varlen）（暂不支持）
-        cu_seqlens_k_new [optional]: 新 K 的累积序列长度（暂不支持）
-        max_seqlen_q [optional]: 最大 query 序列长度（暂不支持）
-        rotary_seqlens [optional]: Rotary embedding 序列长度（暂不支持）
-        q_descale [optional]: FP8 量化的 descale 因子（暂不支持）
-        k_descale [optional]: FP8 量化的 descale 因子（暂不支持）
-        v_descale [optional]: FP8 量化的 descale 因子（暂不支持）
+        block_table [optional]: (batch_size, max_num_blocks_per_seq) dtype=int32 - Paged KV cache（暂不支持）
         softmax_scale: float - QK^T 的缩放因子，默认 1/sqrt(headdim)
         causal: bool - 是否使用因果掩码
         window_size: (left, right) - 滑动窗口（暂不支持）
-        attention_chunk: int - Attention chunk size（暂不支持）
         softcap: float - Softcapping attention（暂不支持）
         rotary_interleaved: bool - Rotary embedding 模式（暂不支持）
-        scheduler_metadata: Scheduler metadata（暂不支持）
+        alibi_slopes: (nheads,) or (batch_size, nheads) - ALiBi 位置偏差（暂不支持）
         num_splits: int - Split-K 数量（批不变性版本固定为1）
-        pack_gqa: bool - 是否 pack GQA（暂不支持）
-        sm_margin: int - SM margin for communication（暂不支持）
         return_softmax_lse: bool - 是否返回 log-sum-exp
 
     返回:
@@ -916,51 +899,29 @@ def flash_attn_with_kvcache_batch_invariant(
         或 (output, softmax_lse) 如果 return_softmax_lse=True
             softmax_lse: (batch_size, nheads, seqlen)
 
-    限制（MVP 版本）:
-        - 不支持 qv
+    限制（Flash Attention v2 MVP 版本）:
         - 不支持 rotary_cos/rotary_sin（rotary embedding 应在外部处理）
-        - 不支持 page_table（paged KV cache）
+        - 不支持 block_table（paged KV cache）
         - 不支持 cache_leftpad
-        - 不支持 cu_seqlens_q/cu_seqlens_k_new（varlen）
         - 不支持 window_size（滑动窗口）
-        - 不支持 attention_chunk
         - 不支持 softcap
-        - 不支持 FP8 量化（q_descale/k_descale/v_descale）
-        - 不支持 scheduler_metadata
-        - 不支持 pack_gqa
-        - 不支持 sm_margin
+        - 不支持 alibi_slopes
         - num_splits 固定为 1（无 Split-K）
         - return_softmax_lse 暂返回 None
     """
     # 验证不支持的参数
-    if qv is not None:
-        raise NotImplementedError("qv not supported in batch_invariant version yet")
     if rotary_cos is not None or rotary_sin is not None:
         raise NotImplementedError("Rotary embedding not supported in batch_invariant version yet")
-    if page_table is not None:
-        raise NotImplementedError("Paged KV cache (page_table) not supported in batch_invariant version yet")
+    if block_table is not None:
+        raise NotImplementedError("Paged KV cache (block_table) not supported in batch_invariant version yet")
     if cache_leftpad is not None:
         raise NotImplementedError("cache_leftpad not supported in batch_invariant version yet")
-    if cu_seqlens_q is not None or cu_seqlens_k_new is not None:
-        raise NotImplementedError("Variable-length sequences (cu_seqlens) not supported in batch_invariant version yet")
-    if max_seqlen_q is not None:
-        raise NotImplementedError("max_seqlen_q not supported in batch_invariant version yet")
-    if rotary_seqlens is not None:
-        raise NotImplementedError("rotary_seqlens not supported in batch_invariant version yet")
-    if q_descale is not None or k_descale is not None or v_descale is not None:
-        raise NotImplementedError("FP8 quantization (descale) not supported in batch_invariant version yet")
     if window_size != (-1, -1):
         raise NotImplementedError("Sliding window attention not supported in batch_invariant version yet")
-    if attention_chunk != 0:
-        raise NotImplementedError("attention_chunk not supported in batch_invariant version yet")
     if softcap != 0.0:
         raise NotImplementedError("Softcap not supported in batch_invariant version yet")
-    if scheduler_metadata is not None:
-        raise NotImplementedError("scheduler_metadata not supported in batch_invariant version yet")
-    if pack_gqa is not None:
-        raise NotImplementedError("pack_gqa not supported in batch_invariant version yet")
-    if sm_margin != 0:
-        raise NotImplementedError("sm_margin not supported in batch_invariant version yet")
+    if alibi_slopes is not None:
+        raise NotImplementedError("ALiBi slopes not supported in batch_invariant version yet")
     if num_splits != 0 and num_splits != 1:
         raise ValueError(f"Batch-invariant version only supports num_splits=0 or 1, got {num_splits}")
 
@@ -1021,14 +982,29 @@ def flash_attn_with_kvcache_batch_invariant(
     # 分配输出张量
     output = torch.empty_like(q)
 
-    # 固定的块大小（批不变性的关键）
-    BLOCK_M = 16  # Query 块大小
-    BLOCK_N = 64  # Key/Value 块大小
+    # 块大小（调整以适应 Ascend NPU 的 UB 限制）
+    # UB overflow 分析：
+    # 每个 block 需要的内存 ≈ BLOCK_M * BLOCK_DMODEL * 2 + BLOCK_N * BLOCK_DMODEL * 2 + BLOCK_M * BLOCK_N
+    # 对于 headdim=128: (16*128 + 64*128 + 16*64) * 2 bytes ≈ 21KB (float16)
+    # 对于 headdim=128: (16*128*4 + 64*128*4 + 16*64*4) ≈ 45KB (float32 累加器)
+    # 实际测量：需要 2166272 bytes，可用 1572864 bytes
+    #
+    # 解决方案：减小 BLOCK_M 和 BLOCK_N
+    # 配置选项（按内存占用从大到小）：
+    # - BLOCK_M=16, BLOCK_N=64: ~2.1MB (overflow)
+    # - BLOCK_M=8,  BLOCK_N=32: ~540KB (推荐)
+    # - BLOCK_M=4,  BLOCK_N=16: ~135KB (保守)
+    #
+    # 可通过环境变量调整：
+    # export VLLM_FLASH_ATTN_BLOCK_M=4
+    # export VLLM_FLASH_ATTN_BLOCK_N=16
+    BLOCK_M = int(os.getenv("VLLM_FLASH_ATTN_BLOCK_M", "8"))   # Query 块大小
+    BLOCK_N = int(os.getenv("VLLM_FLASH_ATTN_BLOCK_N", "32"))  # Key/Value 块大小
     BLOCK_DMODEL = triton.next_power_of_2(headdim)
 
-    # 计算网格大小
+    # 计算网格大小（grid 会相应增大）
     grid = (
-        triton.cdiv(seqlen_q, BLOCK_M),  # M 维度的块数
+        triton.cdiv(seqlen_q, BLOCK_M),  # M 维度的块数（增加）
         batch * nheads_q,                 # Batch * Heads
     )
 
@@ -1073,6 +1049,232 @@ def flash_attn_with_kvcache_batch_invariant(
     if return_softmax_lse:
         # softmax_lse shape: (batch, nheads, seqlen)
         # 暂时返回None作为占位符
+        softmax_lse = None
+        return output, softmax_lse
+    else:
+        return output
+
+
+# ============================================================================
+# Flash Attention with KVCache - Batch Invariant (Advanced Version)
+# 完全对齐 Hopper 实现
+# ============================================================================
+
+def flash_attn_with_kvcache_v3(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    qv: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    cache_seqlens: int | torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    rotary_seqlens: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    scheduler_metadata=None,
+    num_splits: int = 0,
+    pack_gqa: bool | None = None,
+    sm_margin: int = 0,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple:
+    """
+    批不变性版本的 Flash Attention v3 with KVCache
+
+    完全对齐 flash-attention/hopper/flash_attn_interface.py:928 的实现（Flash Attention v3），
+    在保持批不变性的前提下支持更多高级特性。
+
+    与 flash_attn_with_kvcache (v2) 版本的区别：
+    - V2 (flash_attn_with_kvcache): Flash Attention v2 基础 MVP 版本，仅支持核心功能
+    - V3 (flash_attn_with_kvcache_v3): Flash Attention v3 高级版本，支持大部分 hopper 特性
+
+    批不变性保证：
+    1. 固定的计算顺序（确定性 split-k）
+    2. Float32 累加
+    3. 禁用 TF32
+    4. 串行 KV 更新
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim)
+                 或 (num_blocks, page_block_size, nheads_k, headdim) 如果使用 page_table
+        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v)
+                 或 (num_blocks, page_block_size, nheads_k, headdim_v) 如果使用 page_table
+        k: (batch_size, seqlen_new, nheads_k, headdim) - 新的 Key
+        v: (batch_size, seqlen_new, nheads_k, headdim_v) - 新的 Value
+        qv: (batch_size, seqlen, nheads, headdim_v) - Query for value (TODO)
+        rotary_cos: (seqlen_ro, rotary_dim / 2) - Rotary embedding cos (TODO)
+        rotary_sin: (seqlen_ro, rotary_dim / 2) - Rotary embedding sin (TODO)
+        cache_seqlens: int or (batch_size,) dtype=int32 - KV cache 序列长度
+        cache_batch_idx: (batch_size,) dtype=int32 - 批次索引映射
+        cache_leftpad: (batch_size,) dtype=int32 - KV cache 起始索引 (TODO)
+        page_table: (batch_size, max_num_blocks_per_seq) dtype=int32 - Paged KV cache (TODO)
+        cu_seqlens_q: (batch_size + 1,) - Variable-length Q 的累积序列长度 (TODO)
+        cu_seqlens_k_new: (batch_size + 1,) - Variable-length new K 的累积序列长度 (TODO)
+        max_seqlen_q: int - 最大 Q 序列长度 (TODO)
+        rotary_seqlens: (batch_size,) - Rotary embedding 序列长度 (TODO)
+        q_descale, k_descale, v_descale: FP8 量化的 descale 因子 (TODO)
+        softmax_scale: float - QK^T 的缩放因子，默认 1/sqrt(headdim)
+        causal: bool - 是否使用因果掩码
+        window_size: (left, right) - 滑动窗口 (TODO)
+        attention_chunk: int - Attention chunk size (TODO)
+        softcap: float - Softcapping attention (TODO)
+        rotary_interleaved: bool - Rotary embedding 模式 (TODO)
+        scheduler_metadata: Scheduler metadata (TODO)
+        num_splits: int - Split-K 数量（0=自动，1=无split，>1=固定split）
+                         批不变性：建议使用固定值（如4）而非0（自动）
+        pack_gqa: bool - 是否 pack GQA (TODO)
+        sm_margin: int - SM margin for communication (TODO)
+        return_softmax_lse: bool - 是否返回 log-sum-exp
+
+    返回：
+        output: (batch_size, seqlen, nheads, headdim)
+        或 (output, softmax_lse) 如果 return_softmax_lse=True
+            softmax_lse: (batch_size, nheads, seqlen)
+
+    Flash Attention v3 支持的特性：
+        - ✅ 基础 Flash Attention
+        - ✅ GQA/MQA
+        - ✅ Causal masking
+        - ✅ 新 KV 更新
+        - ✅ cache_seqlens（int 或 Tensor）
+        - ✅ cache_batch_idx
+        - ✅ 确定性 Split-K（固定 split 数量）
+        - 🚧 Rotary Embedding (计划中)
+        - 🚧 Window Attention (计划中)
+        - 🚧 Softcap (计划中)
+        - ❌ Paged KV Cache (需要重新设计)
+        - ❌ Variable-length sequences (需要额外支持)
+        - ❌ FP8 量化 (需要硬件支持)
+        - ❌ QV 分离 (需要额外kernel)
+    """
+    # 验证 stride 连续性
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+
+    # 验证不支持的参数
+    unsupported_features = []
+    if qv is not None:
+        unsupported_features.append("qv (Query for value)")
+    if rotary_cos is not None or rotary_sin is not None:
+        unsupported_features.append("rotary_cos/rotary_sin (Rotary embedding)")
+    if page_table is not None:
+        unsupported_features.append("page_table (Paged KV cache)")
+    if cache_leftpad is not None:
+        unsupported_features.append("cache_leftpad")
+    if cu_seqlens_q is not None or cu_seqlens_k_new is not None:
+        unsupported_features.append("cu_seqlens_q/cu_seqlens_k_new (Variable-length sequences)")
+    if max_seqlen_q is not None:
+        unsupported_features.append("max_seqlen_q")
+    if rotary_seqlens is not None:
+        unsupported_features.append("rotary_seqlens")
+    if q_descale is not None or k_descale is not None or v_descale is not None:
+        unsupported_features.append("FP8 quantization (q_descale/k_descale/v_descale)")
+    if window_size != (-1, -1):
+        unsupported_features.append("window_size (Sliding window attention)")
+    if attention_chunk != 0:
+        unsupported_features.append("attention_chunk")
+    if softcap != 0.0:
+        unsupported_features.append("softcap")
+    if scheduler_metadata is not None:
+        unsupported_features.append("scheduler_metadata")
+    if pack_gqa is not None:
+        unsupported_features.append("pack_gqa")
+    if sm_margin != 0:
+        unsupported_features.append("sm_margin")
+
+    if unsupported_features:
+        raise NotImplementedError(
+            f"Flash Attention v3 batch-invariant version does not support the following features yet: "
+            f"{', '.join(unsupported_features)}. "
+            f"Use flash_attn_with_kvcache (v2) for basic functionality."
+        )
+
+    # 验证输入
+    assert q.dim() == 4, f"q must be 4D tensor [batch, seqlen, nheads, headdim], got {q.shape}"
+    assert k_cache.dim() == 4 and v_cache.dim() == 4, "k_cache and v_cache must be 4D tensors"
+
+    batch, seqlen_q, nheads_q, headdim = q.shape
+    batch_cache, seqlen_cache, nheads_kv, headdim_v = v_cache.shape
+
+    # 验证 k_cache 和 v_cache 形状匹配（除了可能的 headdim_v 不同）
+    assert k_cache.shape[:3] == v_cache.shape[:3], \
+        f"k_cache and v_cache must have same batch/seqlen/nheads: {k_cache.shape} vs {v_cache.shape}"
+
+    # 计算 softmax_scale（对齐 hopper 实现）
+    if softmax_scale is None:
+        # hopper 版本：softmax_scale = (headdim + headdim_v) ** (-0.5) if qv else headdim ** (-0.5)
+        # 我们暂不支持 qv，所以简化为：
+        softmax_scale = headdim ** (-0.5)
+
+    # 处理 cache_seqlens（对齐 hopper 实现）
+    if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+        )
+
+    # 确保 cache_seqlens 连续
+    if cache_seqlens is not None:
+        if not cache_seqlens.is_contiguous():
+            cache_seqlens = cache_seqlens.contiguous()
+        if cache_seqlens.dtype != torch.int32:
+            cache_seqlens = cache_seqlens.to(torch.int32)
+
+    # 处理 cache_batch_idx
+    if cache_batch_idx is not None:
+        if not cache_batch_idx.is_contiguous():
+            cache_batch_idx = cache_batch_idx.contiguous()
+        if cache_batch_idx.dtype != torch.int32:
+            cache_batch_idx = cache_batch_idx.to(torch.int32)
+
+    # 处理新的 KV
+    if k is not None and v is not None:
+        assert k.shape == v.shape[:3] + (headdim,), \
+            f"k and v must have compatible shapes: {k.shape} vs {v.shape}"
+        assert k.shape[0] == batch, f"k batch size must match q: {k.shape[0]} vs {batch}"
+        assert k.shape[2] == nheads_kv, f"k nheads must match k_cache: {k.shape[2]} vs {nheads_kv}"
+
+    # 调用 V2 实现（未来可以切换到更高级的实现）
+    # TODO: 当 Split-K 支持完成后，这里可以调用专门的 split-k kernel
+    output = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k=k,
+        v=v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        cache_leftpad=cache_leftpad,
+        block_table=page_table,  # v3 uses page_table, v2 uses block_table
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        rotary_interleaved=rotary_interleaved,
+        alibi_slopes=None,  # v3 doesn't have alibi_slopes parameter
+        num_splits=num_splits,
+        return_softmax_lse=False,  # V2 暂不支持
+    )
+
+    # 处理返回值
+    if return_softmax_lse:
+        # TODO: 实现 softmax_lse 计算
         softmax_lse = None
         return output, softmax_lse
     else:

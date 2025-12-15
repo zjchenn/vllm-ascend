@@ -995,7 +995,7 @@ def test_flash_attn_kvcache_basic_batch_invariance():
     不使用新的 KV、GQA、causal masking 等特性
     """
     import torch
-    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache
 
     # 设置随机种子
     torch.manual_seed(42)
@@ -1022,12 +1022,12 @@ def test_flash_attn_kvcache_basic_batch_invariance():
     print(f"{'=' * 80}\n")
 
     # 方法 1：只处理第一个批次
-    out1 = flash_attn_with_kvcache_batch_invariant(
+    out1 = flash_attn_with_kvcache(
         q[:1], k_cache[:1], v_cache[:1]
     )
 
     # 方法 2：处理全部批次，然后切片
-    out2 = flash_attn_with_kvcache_batch_invariant(
+    out2 = flash_attn_with_kvcache(
         q, k_cache, v_cache
     )[:1]
 
@@ -1064,7 +1064,7 @@ def test_flash_attn_kvcache_with_new_kv_batch_invariance():
     测试带有新 KV 更新的批不变性
     """
     import torch
-    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache
 
     torch.manual_seed(42)
 
@@ -1096,13 +1096,13 @@ def test_flash_attn_kvcache_with_new_kv_batch_invariance():
     v_cache_full = v_cache.clone()
 
     # 方法 1：batch_size = 1 with new KV
-    out1 = flash_attn_with_kvcache_batch_invariant(
+    out1 = flash_attn_with_kvcache(
         q[:1], k_cache1, v_cache1,
         k=k_new[:1], v=v_new[:1]
     )
 
     # 方法 2：batch_size = batch with new KV
-    out2 = flash_attn_with_kvcache_batch_invariant(
+    out2 = flash_attn_with_kvcache(
         q, k_cache_full, v_cache_full,
         k=k_new, v=v_new
     )[:1]
@@ -1128,7 +1128,7 @@ def test_flash_attn_kvcache_with_causal_batch_invariance():
     测试 causal masking 下的批不变性
     """
     import torch
-    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache
 
     torch.manual_seed(42)
 
@@ -1151,13 +1151,13 @@ def test_flash_attn_kvcache_with_causal_batch_invariance():
     print(f"{'=' * 80}\n")
 
     # 方法 1：batch_size = 1 with causal
-    out1 = flash_attn_with_kvcache_batch_invariant(
+    out1 = flash_attn_with_kvcache(
         q[:1], k_cache[:1], v_cache[:1],
         causal=True
     )
 
     # 方法 2：batch_size = batch with causal
-    out2 = flash_attn_with_kvcache_batch_invariant(
+    out2 = flash_attn_with_kvcache(
         q, k_cache, v_cache,
         causal=True
     )[:1]
@@ -1183,7 +1183,7 @@ def test_flash_attn_kvcache_with_gqa_batch_invariance():
     测试 GQA（Grouped Query Attention）的批不变性
     """
     import torch
-    from vllm_ascend.batch_invariant import flash_attn_with_kvcache_batch_invariant
+    from vllm_ascend.batch_invariant import flash_attn_with_kvcache
 
     torch.manual_seed(42)
 
@@ -1208,12 +1208,12 @@ def test_flash_attn_kvcache_with_gqa_batch_invariance():
     print(f"{'=' * 80}\n")
 
     # 方法 1：batch_size = 1 with GQA
-    out1 = flash_attn_with_kvcache_batch_invariant(
+    out1 = flash_attn_with_kvcache(
         q[:1], k_cache[:1], v_cache[:1]
     )
 
     # 方法 2：batch_size = batch with GQA
-    out2 = flash_attn_with_kvcache_batch_invariant(
+    out2 = flash_attn_with_kvcache(
         q, k_cache, v_cache
     )[:1]
 
