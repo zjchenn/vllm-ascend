@@ -12,6 +12,8 @@ from vllm.model_executor.layers.batch_invariant import (
      _log_softmax_batch_invariant,
     softmax_batch_invariant)
 
+import triton.runtime.driver as driver
+
 
 @triton.jit
 def matmul_bias_persistent_kernel(
@@ -387,6 +389,7 @@ def _rms_norm_kernel(
     output_ptr,
     input_row_stride,
     output_row_stride,
+    n_rows,  # 新增参数：总行数
     n_cols,
     eps,
     BLOCK_SIZE: tl.constexpr,
@@ -394,48 +397,58 @@ def _rms_norm_kernel(
     """
     Compute RMS normalization along the last dimension of a 2D tensor.
     RMS Norm: y = x / sqrt(mean(x^2) + eps) * weight
-    Each block handles one row of the input tensor.
+    Each program handles multiple rows of the input tensor.
     """
-    row_idx = tl.program_id(0).to(tl.int64)
-    row_start_ptr = input_ptr + row_idx * input_row_stride
-    output_row_start_ptr = output_ptr + row_idx * output_row_stride
+    pid = tl.program_id(0)  # 程序ID
+    n_programs = tl.num_programs(0)  # 网格大小（固定值，例如1024）
 
-    # Step 1: Compute sum of squares in float32 to avoid overflow
-    sum_sq = tl.zeros([1], dtype=tl.float32)
-    for col_offset in range(0, n_cols, BLOCK_SIZE):
-        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
-        mask = col_idx < n_cols
+    # 计算每个程序处理的行数（向上取整）
+    rows_per_program = (n_rows + n_programs - 1) // n_programs    
+    start_row = pid * rows_per_program    
+    end_row = tl.minimum(start_row + rows_per_program, n_rows)
 
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
-        # Convert to float32 for accumulation to prevent overflow
-        vals_f32 = vals.to(tl.float32)
-        sq_vals = vals_f32 * vals_f32
-        sum_sq += tl.sum(tl.where(mask, sq_vals, 0.0))
+    # 循环处理分配给该程序的多行
+    for row_idx in range(start_row, end_row):
+        row_start_ptr = input_ptr + row_idx * input_row_stride        
+        output_row_start_ptr = output_ptr + row_idx * output_row_stride
 
-    # Step 2: Compute RMS (root mean square) in float32
-    mean_sq = sum_sq / n_cols
-    rms = tl.sqrt(mean_sq + eps)
-    inv_rms = 1.0 / RMS
+        # Step 1: Compute sum of squares in float32 to avoid overflow
+        sum_sq = tl.zeros([1], dtype=tl.float32)
+        for col_offset in range(0, n_cols, BLOCK_SIZE):
+            col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+            mask = col_idx < n_cols
 
-    # Step 3: Normalize and apply weight
-    for col_offset in range(0, n_cols, BLOCK_SIZE):
-        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
-        mask = col_idx < n_cols
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
-        weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
-        # Compute in float32 then convert back to input dtype
-        vals_f32 = vals.to(tl.float32)
-        weight_f32 = weight.to(tl.float32)
-        output_f32 = vals_f32 * inv_rms * weight_f32
-        output = output_f32.to(vals.dtype)
-        tl.store(output_row_start_ptr + col_idx, output, mask=mask)
+            vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+            vals_f32 = vals.to(tl.float32)
+            sq_vals = vals_f32 * vals_f32            
+            sum_sq += tl.sum(tl.where(mask, sq_vals, 0.0))
+
+        # Step 2: Compute RMS (root mean square) in float32
+        mean_sq = sum_sq / n_cols        
+        rms = tl.sqrt(mean_sq + eps)
+        inv_rms = 1.0 / rms
+
+        # Step 3: Normalize and apply weight
+        for col_offset in range(0, n_cols, BLOCK_SIZE):
+            col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+            mask = col_idx < n_cols            
+            vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+            weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
+            vals_f32 = vals.to(tl.float32)
+            weight_f32 = weight.to(tl.float32)
+            output_f32 = vals_f32 * inv_rms * weight_f32            
+            output = output_f32.to(vals.dtype)
+            tl.store(output_row_start_ptr + col_idx, output, mask=mask)
 
 
 def rms_norm(
-        input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+    input: torch.Tensor, 
+    weight: torch.Tensor, 
+    eps: float = 1e-6,
+                    
 ) -> torch.Tensor:
     """
-    Compute RMS normalization using Triton kernel.
+    Compute RMS normalization using Triton kernel with fixed grid size.
 
     RMS Norm normalizes the input by the root mean square and scales by weight:
     output = input / sqrt(mean(input^2) + eps) * weight
@@ -455,21 +468,27 @@ def rms_norm(
     )
 
     # Flatten all dimensions except the last one
-    original_shape = input.shape
+    original_shape = input.shape    
     input_2d = input.reshape(-1, input.shape[-1])
     input_2d = input_2d.contiguous()
     weight = weight.contiguous()
 
     n_rows, n_cols = input_2d.shape
-    output = torch.empty_like(input_2d)
-    BLOCK_SIZE = 1024
-    grid = (n_rows,)
+
+    output = torch.empty_like(input_2d, dtype=input.dtype)
+    BLOCK_SIZE = 1024  # 保持原有的BLOCK_SIZE
+    max_grid_size = driver.active.utils.get_device_properties(torch.npu.current_device())["num_vectorcore"]
+
+    # 固定网格大小，使用min避免当n_rows较小时启动过多程序
+    grid = (min(n_rows, max_grid_size),)
+
     _rms_norm_kernel[grid](
         input_2d,
         weight,
         output,
         input_2d.stride(0),
         output.stride(0),
+        n_rows,  # 传入总行数
         n_cols,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
