@@ -60,8 +60,8 @@ def matmul_bias_persistent_kernel(
         y_mask = ((rk[:, None] + k_start) < K) & (rn[None, :] < N)
                                                                                                                                     
         # 从全局内存加载数据块
-        x_chunk = tl.load(x_ptrs, mask=x_mask, other=0.0)
-        y_chunk = tl.load(y_ptrs, mask=y_mask, other=0.0)
+        x_chunk = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.float32)
+        y_chunk = tl.load(y_ptrs, mask=y_mask, other=0.0).to(tl.float32)
                                                                                                                                                                     
         # 计算矩阵乘法累加
         acc += tl.dot(x_chunk, y_chunk, allow_tf32=False)
@@ -71,7 +71,7 @@ def matmul_bias_persistent_kernel(
         # 加载偏置值（广播到所有行）
         bias_ptrs = bias_ptr + rn * stride_bias        
         bias_mask = rn < None        
-        bias_vals = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+        bias_vals = tl.load(bias_ptrs, mask=bias_mask, other=0.0).to(tl.float32)
         # 将偏置加到累加器上（自动广播）
         acc += bias_vals[None, :]
                                                                                                                                                                                                                                         
@@ -80,7 +80,7 @@ def matmul_bias_persistent_kernel(
     out_mask = (rm[:, None] < M) & (rn[None, :] < N)
                                                                                                                                                                                                                                                     
     # 将结果存储到全局内存
-    tl.store(out_ptrs, acc, mask=out_mask)
+    tl.store(out_ptrs, acc.to(out_ptrs.dtype.element_ty), mask=out_mask)
 
 
 def matmul_persistent(x, y, bias=None):
@@ -108,7 +108,7 @@ def matmul_persistent(x, y, bias=None):
         assert y.shape[1] == bias.shape[0], f"偏置维度不匹配: y.shape[1]={y.shape[1]}, bias.shape[0]={bias.shape[0]}"
                                                                                                                         
     # 分配输出张量（与x相同的数据类型）
-    output = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    output = torch.zeros((M, N), dtype=x.dtype, device=x.device)
                                                                                                                                     
     # 定义分块大小（可根据硬件调整）
     BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128
@@ -119,7 +119,7 @@ def matmul_persistent(x, y, bias=None):
     # 处理bias为None的情况
     if bias is None:
         # 创建一个虚拟的bias张量（不会被使用，因为has_bias=False）
-        dummy_bias = torch.empty(0, dtype=x.dtype, device=x.device)
+        dummy_bias = torch.zeros(0, dtype=x.dtype, device=x.device)
         has_bias = False
         bias_stride = 0
         bias_to_pass = dummy_bias    
