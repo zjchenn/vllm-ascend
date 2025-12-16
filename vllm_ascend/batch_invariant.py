@@ -338,7 +338,7 @@ def mean_dim(
         output_shape = shape[:dim] + shape[dim + 1 :]
 
     # Create output tensor
-    output = torch.empty(output_shape, dtype=dtype, device=input.device)
+    output = torch.zeros(output_shape, dtype=dtype, device=input.device)
 
     # Reshape output for kernel
     if keepdim:
@@ -475,7 +475,7 @@ def rms_norm(
 
     n_rows, n_cols = input_2d.shape
 
-    output = torch.empty_like(input_2d, dtype=input.dtype)
+    output = torch.zeros_like(input_2d, dtype=input.dtype)
     BLOCK_SIZE = 1024  # 保持原有的BLOCK_SIZE
     max_grid_size = driver.active.utils.get_device_properties(torch.npu.current_device())["num_vectorcore"]
 
