@@ -108,7 +108,7 @@ def matmul_persistent(x, y, bias=None):
         assert y.shape[1] == bias.shape[0], f"偏置维度不匹配: y.shape[1]={y.shape[1]}, bias.shape[0]={bias.shape[0]}"
                                                                                                                         
     # 分配输出张量（与x相同的数据类型）
-    output = torch.zeros((M, N), dtype=x.dtype, device=x.device)
+    output = torch.empty((M, N), dtype=x.dtype, device=x.device)
                                                                                                                                     
     # 定义分块大小（可根据硬件调整）
     BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128
@@ -119,7 +119,7 @@ def matmul_persistent(x, y, bias=None):
     # 处理bias为None的情况
     if bias is None:
         # 创建一个虚拟的bias张量（不会被使用，因为has_bias=False）
-        dummy_bias = torch.zeros(0, dtype=x.dtype, device=x.device)
+        dummy_bias = torch.empty(0, dtype=x.dtype, device=x.device)
         has_bias = False
         bias_stride = 0
         bias_to_pass = dummy_bias    
@@ -338,7 +338,7 @@ def mean_dim(
         output_shape = shape[:dim] + shape[dim + 1 :]
 
     # Create output tensor
-    output = torch.zeros(output_shape, dtype=dtype, device=input.device)
+    output = torch.empty(output_shape, dtype=dtype, device=input.device)
 
     # Reshape output for kernel
     if keepdim:
@@ -475,7 +475,7 @@ def rms_norm(
 
     n_rows, n_cols = input_2d.shape
 
-    output = torch.zeros_like(input_2d, dtype=input.dtype)
+    output = torch.empty_like(input_2d, dtype=input.dtype)
     BLOCK_SIZE = 1024  # 保持原有的BLOCK_SIZE
     max_grid_size = driver.active.utils.get_device_properties(torch.npu.current_device())["num_vectorcore"]
 

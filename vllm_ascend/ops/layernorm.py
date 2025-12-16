@@ -66,7 +66,7 @@ class AscendRMSNorm(RMSNorm):
                                                 self.variance_epsilon)
             else:
                 if vllm_is_batch_invariant():
-                    x, _ = rms_norm_batch_invariant(
+                    x = rms_norm_batch_invariant(
                         x + residual,  self.weight, self.variance_epsilon
                     )
                     residual = x + residual
