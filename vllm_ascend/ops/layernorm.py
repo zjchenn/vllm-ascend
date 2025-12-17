@@ -57,34 +57,34 @@ class AscendRMSNorm(RMSNorm):
             if get_ascend_device_type() == AscendDeviceType._310P:
                 orig_dtype = residual.dtype
                 x = x + residual.to(x.dtype)
-                residual = x.to(orig_dtype)
+                residual_out = x.to(orig_dtype)
                 if vllm_is_batch_invariant():
-                    x = rms_norm_batch_invariant(x, self.weight,
+                    x_out = rms_norm_batch_invariant(x, self.weight,
                                                 self.variance_epsilon)
                 else:
-                    x, _ = torch_npu.npu_rms_norm(x, self.weight,
+                    x_out, _ = torch_npu.npu_rms_norm(x, self.weight,
                                                 self.variance_epsilon)
             else:
                 if vllm_is_batch_invariant():
-                    x = rms_norm_batch_invariant(
+                    residual_out = x + residual
+                    x_out = rms_norm_batch_invariant(
                         x + residual,  self.weight, self.variance_epsilon
                     )
-                    residual = x + residual
                 else:
-                    x, _, residual = torch_npu.npu_add_rms_norm(
+                    x_out, _, residual_out = torch_npu.npu_add_rms_norm(
                         x, residual, self.weight, self.variance_epsilon)
                 if self.bias is not None:
-                    x.add_(self.bias)
-            return x, residual
+                    x_out.add_(self.bias)
+            return x_out, residual_out
         if vllm_is_batch_invariant():
-            x = rms_norm_batch_invariant(x, self.weight,
+            x_out = rms_norm_batch_invariant(x, self.weight,
                                                     self.variance_epsilon)
         else:
-            x, residual = torch_npu.npu_rms_norm(x, self.weight,
+            x_out, _ = torch_npu.npu_rms_norm(x, self.weight,
                                                     self.variance_epsilon)
         if self.bias is not None:
-            x.add_(self.bias)
-        return x
+            x_out.add_(self.bias)
+        return x_out
 
 
 class AscendQuantRMSNorm(AscendRMSNorm):
