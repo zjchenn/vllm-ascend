@@ -35,6 +35,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          split_decodes_and_prefills)
+from vllm_ascend.batch_invariant import (flash_attn_with_kvcache,
+                                         vllm_is_batch_invariant)
 from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                update_graph_params_workspaces)
 from vllm_ascend.utils import weak_ref_tensors
@@ -394,6 +396,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.key_cache = None
         self.value_cache = None
 
+        # Batch-invariant mode flag
+        self.batch_invariant_mode = vllm_is_batch_invariant()
+
     def full_graph_attention(self, query: torch.Tensor, key: torch.Tensor,
                              value: torch.Tensor,
                              attn_metadata: AscendMetadata,
@@ -622,6 +627,161 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )[0]
         return output
 
+    # =========================================================================
+    # Batch-Invariant Attention Methods
+    # =========================================================================
+    # These methods use the batch-invariant Triton flash attention kernel
+    # to ensure deterministic results regardless of batch composition.
+    # =========================================================================
+
+    def _forward_decode_only_batch_invariant(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Batch-invariant decode-only attention using Triton flash attention.
+
+        This method converts from TND layout to BSHD layout, calls the
+        batch-invariant flash attention kernel, and converts back.
+
+        Args:
+            query: [num_tokens, num_heads, head_size] in TND layout
+            attn_metadata: Attention metadata containing sequence info
+            output: Optional output tensor
+
+        Returns:
+            output: [num_tokens, num_heads, head_size]
+        """
+        batch_size = attn_metadata.seq_lens.shape[0]
+        seq_lens = attn_metadata.seq_lens  # (batch_size,)
+
+        # For decode, each request has exactly 1 query token
+        # query shape: [batch_size, num_heads, head_size] (already in TND with T=batch)
+        # Reshape to BSHD: [batch_size, 1, num_heads, head_size]
+        q_bshd = query[:batch_size].view(batch_size, 1, self.num_heads, self.head_size)
+
+        # Get KV cache: [num_blocks, block_size, num_kv_heads, head_size]
+        # We need to gather the relevant blocks for each sequence
+        block_tables = attn_metadata.block_tables  # [batch_size, max_blocks]
+
+        # For simplicity in batch-invariant mode, we'll process each sequence
+        # independently. This ensures batch invariance at the cost of parallelism.
+        # TODO: Optimize this with a proper paged attention kernel
+        max_seq_len = seq_lens.max().item()
+        block_size = self.key_cache.shape[1]
+
+        # Allocate contiguous KV tensors for batch processing
+        # Shape: [batch_size, max_seq_len, num_kv_heads, head_size]
+        k_gathered = torch.zeros(
+            batch_size, max_seq_len, self.num_kv_heads, self.head_size,
+            dtype=query.dtype, device=query.device
+        )
+        v_gathered = torch.zeros(
+            batch_size, max_seq_len, self.num_kv_heads, self.head_size,
+            dtype=query.dtype, device=query.device
+        )
+
+        # Gather KV cache for each sequence
+        for b in range(batch_size):
+            seq_len = seq_lens[b].item()
+            num_blocks_needed = (seq_len + block_size - 1) // block_size
+
+            for block_idx in range(num_blocks_needed):
+                block_num = block_tables[b, block_idx].item()
+                start_pos = block_idx * block_size
+                end_pos = min(start_pos + block_size, seq_len)
+                actual_len = end_pos - start_pos
+
+                k_gathered[b, start_pos:end_pos] = self.key_cache[block_num, :actual_len]
+                v_gathered[b, start_pos:end_pos] = self.value_cache[block_num, :actual_len]
+
+        # Call batch-invariant flash attention
+        # Note: cache_seqlens tells the kernel the actual sequence lengths
+        attn_output = flash_attn_with_kvcache(
+            q_bshd,
+            k_gathered,
+            v_gathered,
+            cache_seqlens=seq_lens.int(),
+            causal=True,
+            softmax_scale=self.scale,
+        )
+
+        # Convert back to TND layout: [batch_size, 1, num_heads, head_size] -> [batch_size, num_heads, head_size]
+        attn_output = attn_output.view(batch_size, self.num_heads, self.head_size)
+
+        if output is not None:
+            output[:batch_size] = attn_output
+            return output
+        return attn_output
+
+    def _forward_prefill_batch_invariant(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Batch-invariant prefill attention using Triton flash attention.
+
+        For prefill, we have variable-length sequences packed into a single
+        tensor. We process each sequence independently to ensure batch invariance.
+
+        Args:
+            query: [num_tokens, num_heads, head_size] in TND layout
+            key: [num_tokens, num_kv_heads, head_size] in TND layout
+            value: [num_tokens, num_kv_heads, head_size] in TND layout
+            attn_metadata: Attention metadata containing sequence info
+            output: Output tensor [num_tokens, num_heads, head_size]
+
+        Returns:
+            output: [num_tokens, num_heads, head_size]
+        """
+        # Get sequence boundaries from query_start_loc
+        query_start_loc = attn_metadata.query_start_loc_list  # List of cumulative positions
+        num_seqs = len(query_start_loc)
+
+        # Process each sequence independently
+        prev_end = 0
+        for seq_idx in range(num_seqs):
+            seq_end = query_start_loc[seq_idx]
+            seq_len = seq_end - prev_end
+
+            if seq_len == 0:
+                prev_end = seq_end
+                continue
+
+            # Extract Q, K, V for this sequence
+            # Shape: [seq_len, num_heads, head_size]
+            q_seq = query[prev_end:seq_end]
+            k_seq = key[prev_end:seq_end]
+            v_seq = value[prev_end:seq_end]
+
+            # Convert to BSHD: [1, seq_len, num_heads, head_size]
+            q_bshd = q_seq.unsqueeze(0)
+            k_bshd = k_seq.unsqueeze(0)
+            v_bshd = v_seq.unsqueeze(0)
+
+            # Call batch-invariant flash attention
+            attn_output = flash_attn_with_kvcache(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                causal=True,
+                softmax_scale=self.scale,
+            )
+
+            # Convert back to TND and store
+            # [1, seq_len, num_heads, head_size] -> [seq_len, num_heads, head_size]
+            output[prev_end:seq_end] = attn_output.squeeze(0)
+
+            prev_end = seq_end
+
+        return output
+
     def reshape_and_cache(
         self,
         key: torch.Tensor,
@@ -653,12 +813,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         forward_context: ForwardContext = get_forward_context()
         if not forward_context.capturing:
-            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                output = self._forward_decode_only(query, attn_metadata,
-                                                   output)
+            # Check if batch-invariant mode is enabled
+            if self.batch_invariant_mode:
+                # Use batch-invariant flash attention
+                if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                    output = self._forward_decode_only_batch_invariant(
+                        query, attn_metadata, output)
+                else:
+                    output = self._forward_prefill_batch_invariant(
+                        query, key, value, attn_metadata, output)
             else:
-                output = self._forward_prefill(query, key, value,
-                                               attn_metadata, output)
+                # Use standard NPU attention kernels
+                if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                    output = self._forward_decode_only(query, attn_metadata,
+                                                       output)
+                else:
+                    output = self._forward_prefill(query, key, value,
+                                                   attn_metadata, output)
         else:
             attn_output, num_tokens = self.full_graph_attention(
                 query, key, value, attn_metadata, output)
