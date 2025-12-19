@@ -715,10 +715,14 @@ def _flash_attn_with_kvcache_kernel(
 
     # Iterate over K/V blocks
     # For causal masking, we only need to iterate up to the diagonal
+    # Note: Causal mask is aligned to bottom-right corner of attention matrix
+    # This means query at position i can attend to keys at positions <= i + (seqlen_k - seqlen_q)
+    causal_offset = seqlen_k - seqlen_q  # Offset for bottom-right alignment
+
     if is_causal:
         # For causal attention, the last valid K position for query at position q_pos
-        # is q_pos (aligned to bottom-right corner of attention matrix)
-        kv_len = tl.minimum(seqlen_k, q_start + BLOCK_M)
+        # is q_pos + causal_offset (aligned to bottom-right corner of attention matrix)
+        kv_len = tl.minimum(seqlen_k, q_start + BLOCK_M + causal_offset)
     else:
         kv_len = seqlen_k
 
@@ -749,9 +753,12 @@ def _flash_attn_with_kvcache_kernel(
 
         # Apply causal mask if needed
         if is_causal:
-            # Causal mask: query at position i can only attend to keys at positions <= i
-            # Aligned to bottom-right corner
-            causal_mask = offs_m[:, None] >= offs_kv[None, :]
+            # Causal mask: query at position i can only attend to keys at positions <= i + offset
+            # This aligns the mask to the bottom-right corner of the attention matrix
+            # Example: if seqlen_q=2, seqlen_k=5, offset=3
+            #   Q0 can attend to K0,K1,K2,K3 (positions <= 0+3)
+            #   Q1 can attend to K0,K1,K2,K3,K4 (positions <= 1+3)
+            causal_mask = (offs_m[:, None] + causal_offset) >= offs_kv[None, :]
             scores = tl.where(causal_mask, scores, float("-inf"))
 
         # Apply boundary mask for keys beyond seqlen_k
