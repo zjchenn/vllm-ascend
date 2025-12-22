@@ -730,6 +730,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         For prefill, we have variable-length sequences packed into a single
         tensor. We process each sequence independently to ensure batch invariance.
 
+        This method handles different attention states:
+        - PrefillNoCache: Q, K, V all come from input (same length)
+        - PrefillCacheHit/ChunkedPrefill: Q from input, K/V from KV cache (different lengths)
+
         Args:
             query: [num_tokens, num_heads, head_size] in TND layout
             key: [num_tokens, num_kv_heads, head_size] in TND layout
@@ -739,6 +743,32 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         Returns:
             output: [num_tokens, num_heads, head_size]
+        """
+        # Determine if we need to read from KV cache
+        use_kv_cache = attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+
+        if use_kv_cache and self.key_cache is not None:
+            # ChunkedPrefill or PrefillCacheHit: K/V come from cache
+            return self._forward_prefill_with_cache_batch_invariant(
+                query, attn_metadata, output
+            )
+        else:
+            # PrefillNoCache: K/V come from input (same length as Q)
+            return self._forward_prefill_no_cache_batch_invariant(
+                query, key, value, attn_metadata, output
+            )
+
+    def _forward_prefill_no_cache_batch_invariant(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Batch-invariant prefill without KV cache (first prefill).
+        Q and K/V have the same length per sequence.
         """
         # Get sequence boundaries from query_start_loc
         query_start_loc = attn_metadata.query_start_loc_list  # List of cumulative positions
@@ -779,6 +809,86 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output[prev_end:seq_end] = attn_output.squeeze(0)
 
             prev_end = seq_end
+
+        return output
+
+    def _forward_prefill_with_cache_batch_invariant(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Batch-invariant prefill with KV cache (chunked prefill or cache hit).
+        Q length may differ from K/V length.
+        K/V must be gathered from paged KV cache.
+        """
+        # Get sequence info
+        # query_start_loc_list: cumulative Q token positions [q_end_0, q_end_1, ...]
+        # seq_lens_list: K/V lengths for each sequence [kv_len_0, kv_len_1, ...]
+        query_start_loc = attn_metadata.query_start_loc_list
+        kv_seq_lens = attn_metadata.seq_lens_list
+        block_tables = attn_metadata.block_tables
+        block_size = self.key_cache.shape[1]
+
+        num_seqs = len(query_start_loc)
+
+        # Process each sequence independently
+        prev_q_end = 0
+        for seq_idx in range(num_seqs):
+            q_end = query_start_loc[seq_idx]
+            q_len = q_end - prev_q_end
+            kv_len = kv_seq_lens[seq_idx]
+
+            if q_len == 0:
+                prev_q_end = q_end
+                continue
+
+            # Extract Q for this sequence
+            q_seq = query[prev_q_end:q_end]  # [q_len, num_heads, head_size]
+
+            # Gather K/V from paged cache for this sequence
+            num_blocks_needed = (kv_len + block_size - 1) // block_size
+
+            # Allocate contiguous K/V tensors
+            k_gathered = torch.zeros(
+                kv_len, self.num_kv_heads, self.head_size,
+                dtype=query.dtype, device=query.device
+            )
+            v_gathered = torch.zeros(
+                kv_len, self.num_kv_heads, self.head_size,
+                dtype=query.dtype, device=query.device
+            )
+
+            # Gather from paged blocks
+            for block_idx in range(num_blocks_needed):
+                block_num = block_tables[seq_idx, block_idx].item()
+                start_pos = block_idx * block_size
+                end_pos = min(start_pos + block_size, kv_len)
+                actual_len = end_pos - start_pos
+
+                k_gathered[start_pos:end_pos] = self.key_cache[block_num, :actual_len]
+                v_gathered[start_pos:end_pos] = self.value_cache[block_num, :actual_len]
+
+            # Convert to BSHD: [1, seq_len, num_heads, head_size]
+            q_bshd = q_seq.unsqueeze(0)
+            k_bshd = k_gathered.unsqueeze(0)
+            v_bshd = v_gathered.unsqueeze(0)
+
+            # Call batch-invariant flash attention
+            # Note: Q length != K/V length for chunked prefill
+            attn_output = flash_attn_with_kvcache(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                causal=True,
+                softmax_scale=self.scale,
+            )
+
+            # Convert back to TND and store
+            output[prev_q_end:q_end] = attn_output.squeeze(0)
+
+            prev_q_end = q_end
 
         return output
 
