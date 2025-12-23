@@ -182,8 +182,8 @@ def linear_persistent_kernel(
         n_indices = start_n + tl.arange(0, BLOCK_N)
                                                                                                                                                                         
         # 创建掩码以处理边界
-        m_mask = m_indices < Max        
-        n_mask = n_indices < New        
+        m_mask = m_indices < M        
+        n_mask = n_indices < N        
 
         # 初始化累加器为0
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
