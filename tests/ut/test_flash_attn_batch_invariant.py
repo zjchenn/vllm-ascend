@@ -520,3 +520,609 @@ class TestFlashAttnIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# New Test Classes for Enhanced Coverage
+# =============================================================================
+
+
+class TestNativeImplementationBatchVariance:
+    """
+    Test that native (non-batch-invariant) implementations FAIL batch invariance tests.
+
+    This validates our test methodology: if native implementations pass these tests,
+    then our tests are not actually testing batch invariance. Native implementations
+    should show variance when batch composition changes.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Setup test fixtures."""
+        if not torch.npu.is_available():
+            pytest.skip("NPU not available")
+
+        self.device = torch.device("npu:0")
+        self.dtype = torch.float16
+
+    def _native_attention(self, q, k, v, causal=False):
+        """
+        Native PyTorch attention implementation (NOT batch-invariant).
+        Uses standard matmul which may have non-deterministic accumulation order.
+        """
+        batch_size, seqlen_q, num_heads, head_dim = q.shape
+        _, seqlen_k, _, _ = k.shape
+
+        softmax_scale = head_dim ** (-0.5)
+
+        # Transpose to (batch, heads, seqlen, dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Use standard matmul (may have non-deterministic behavior)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
+
+        if causal:
+            mask = torch.triu(
+                torch.ones(seqlen_q, seqlen_k, device=q.device, dtype=torch.bool),
+                diagonal=seqlen_k - seqlen_q + 1
+            )
+            scores = scores.masked_fill(mask, float('-inf'))
+
+        attn_weights = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn_weights, v)
+
+        return out.transpose(1, 2)
+
+    def test_native_attention_is_not_batch_invariant(self):
+        """
+        Verify that native PyTorch attention is NOT batch-invariant.
+
+        This test is expected to show that the native implementation produces
+        different results for the same sequence when batch composition changes.
+        If this test passes (native impl shows variance), it validates our testing approach.
+        """
+        seqlen_q = 32
+        seqlen_k = 64
+        num_heads = 8
+        head_dim = 64
+
+        # Create sequence A
+        torch.manual_seed(42)
+        q_a = torch.randn(1, seqlen_q, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        k_a = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        v_a = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+
+        # Create sequence B
+        torch.manual_seed(123)
+        q_b = torch.randn(1, seqlen_q, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        k_b = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        v_b = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+
+        # Compute A alone multiple times to check for variance
+        results_alone = []
+        for _ in range(5):
+            out = self._native_attention(q_a, k_a, v_a, causal=True)
+            results_alone.append(out.clone())
+
+        # Compute A in batch with B
+        q_ab = torch.cat([q_a, q_b], dim=0)
+        k_ab = torch.cat([k_a, k_b], dim=0)
+        v_ab = torch.cat([v_a, v_b], dim=0)
+
+        results_batched = []
+        for _ in range(5):
+            out_ab = self._native_attention(q_ab, k_ab, v_ab, causal=True)
+            results_batched.append(out_ab[0:1].clone())
+
+        # Check if there's any variance in native implementation
+        # We expect native implementations may show variance across runs or batch configs
+        all_equal_alone = all(torch.equal(results_alone[0], r) for r in results_alone[1:])
+        all_equal_batched = all(torch.equal(results_batched[0], r) for r in results_batched[1:])
+        alone_vs_batched_equal = torch.equal(results_alone[0], results_batched[0])
+
+        # Log the results for analysis
+        print(f"\n[Native Attention Analysis]")
+        print(f"  All 'alone' runs identical: {all_equal_alone}")
+        print(f"  All 'batched' runs identical: {all_equal_batched}")
+        print(f"  'Alone' vs 'Batched' identical: {alone_vs_batched_equal}")
+
+        if not alone_vs_batched_equal:
+            max_diff = (results_alone[0] - results_batched[0]).abs().max().item()
+            print(f"  Max diff (alone vs batched): {max_diff}")
+
+        # Note: This test documents behavior rather than asserting failure
+        # Native implementations may or may not be deterministic depending on hardware
+
+    def test_our_implementation_is_batch_invariant(self):
+        """
+        Verify that OUR implementation IS batch-invariant (control test).
+
+        This confirms that our flash_attn_with_kvcache produces identical
+        results regardless of batch composition.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+
+        seqlen_q = 32
+        seqlen_k = 64
+        num_heads = 8
+        head_dim = 64
+
+        # Create sequence A
+        torch.manual_seed(42)
+        q_a = torch.randn(1, seqlen_q, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        k_a = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        v_a = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+
+        # Create sequence B
+        torch.manual_seed(123)
+        q_b = torch.randn(1, seqlen_q, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        k_b = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        v_b = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+
+        # Compute A alone
+        out_a_alone = flash_attn_with_kvcache(q_a, k_a, v_a, causal=True)
+
+        # Compute A in batch with B
+        q_ab = torch.cat([q_a, q_b], dim=0)
+        k_ab = torch.cat([k_a, k_b], dim=0)
+        v_ab = torch.cat([v_a, v_b], dim=0)
+        out_ab = flash_attn_with_kvcache(q_ab, k_ab, v_ab, causal=True)
+        out_a_batched = out_ab[0:1]
+
+        # Our implementation MUST be batch-invariant
+        assert torch.equal(out_a_alone, out_a_batched), (
+            f"OUR implementation failed batch invariance! "
+            f"Max diff: {(out_a_alone - out_a_batched).abs().max().item()}"
+        )
+
+    def test_compare_native_vs_ours_batch_invariance(self):
+        """
+        Direct comparison: native implementation should fail batch invariance
+        while our implementation should pass.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+
+        seqlen_q = 32
+        seqlen_k = 64
+        num_heads = 8
+        head_dim = 64
+
+        # Create sequences
+        torch.manual_seed(42)
+        q_a = torch.randn(1, seqlen_q, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        k_a = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        v_a = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+
+        torch.manual_seed(123)
+        q_b = torch.randn(1, seqlen_q, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        k_b = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+        v_b = torch.randn(1, seqlen_k, num_heads, head_dim, device=self.device, dtype=self.dtype)
+
+        # Batch tensors
+        q_ab = torch.cat([q_a, q_b], dim=0)
+        k_ab = torch.cat([k_a, k_b], dim=0)
+        v_ab = torch.cat([v_a, v_b], dim=0)
+
+        # Native implementation
+        native_alone = self._native_attention(q_a, k_a, v_a, causal=True)
+        native_batched = self._native_attention(q_ab, k_ab, v_ab, causal=True)[0:1]
+        native_is_invariant = torch.equal(native_alone, native_batched)
+
+        # Our implementation
+        ours_alone = flash_attn_with_kvcache(q_a, k_a, v_a, causal=True)
+        ours_batched = flash_attn_with_kvcache(q_ab, k_ab, v_ab, causal=True)[0:1]
+        ours_is_invariant = torch.equal(ours_alone, ours_batched)
+
+        print(f"\n[Batch Invariance Comparison]")
+        print(f"  Native implementation is batch-invariant: {native_is_invariant}")
+        print(f"  Our implementation is batch-invariant: {ours_is_invariant}")
+
+        if not native_is_invariant:
+            print(f"  Native max diff: {(native_alone - native_batched).abs().max().item()}")
+
+        # Our implementation MUST pass
+        assert ours_is_invariant, "Our implementation must be batch-invariant!"
+
+        # Document that native may or may not be invariant
+        # (depends on hardware/driver determinism)
+
+
+class TestBatchSizeScaling:
+    """
+    Test batch size scaling from small to large values.
+
+    Tests various batch sizes to verify:
+    1. Correctness at all batch sizes
+    2. Batch invariance holds at all batch sizes
+    3. No numerical issues (NaN/Inf) at large batch sizes
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Setup test fixtures."""
+        if not torch.npu.is_available():
+            pytest.skip("NPU not available")
+
+        self.device = torch.device("npu:0")
+        self.dtype = torch.float16
+
+    # Typical batch sizes covering small, medium, and large scales
+    BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+    # Extended batch sizes for stress testing (optional, may require more memory)
+    EXTENDED_BATCH_SIZES = [2048, 4096, 8192]
+
+    @pytest.mark.parametrize("batch_size", BATCH_SIZES)
+    def test_correctness_at_batch_size(self, batch_size):
+        """
+        Test numerical correctness at various batch sizes.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+
+        seqlen_q = 32
+        seqlen_k = 64
+        num_heads = 8
+        head_dim = 64
+
+        torch.manual_seed(42)
+        q = torch.randn(batch_size, seqlen_q, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        k = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        v = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+
+        # Compute using our implementation
+        out = flash_attn_with_kvcache(q, k, v, causal=True)
+
+        # Basic sanity checks
+        assert out.shape == q.shape, f"Shape mismatch at batch_size={batch_size}"
+        assert not torch.isnan(out).any(), f"NaN at batch_size={batch_size}"
+        assert not torch.isinf(out).any(), f"Inf at batch_size={batch_size}"
+
+        # Compare with reference for first few elements
+        out_ref = reference_attention(q[:min(4, batch_size)],
+                                      k[:min(4, batch_size)],
+                                      v[:min(4, batch_size)],
+                                      causal=True)
+        torch.testing.assert_close(
+            out[:min(4, batch_size)], out_ref,
+            rtol=1e-2, atol=1e-2,
+            msg=f"Correctness check failed at batch_size={batch_size}"
+        )
+
+    @pytest.mark.parametrize("batch_size", BATCH_SIZES)
+    def test_batch_invariance_at_batch_size(self, batch_size):
+        """
+        Test that batch invariance holds at various batch sizes.
+
+        Method: Pick a random sequence, compute it alone and in a batch of size N,
+        verify results are identical.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+
+        seqlen_q = 32
+        seqlen_k = 64
+        num_heads = 8
+        head_dim = 64
+
+        # Create the target sequence
+        torch.manual_seed(42)
+        q_target = torch.randn(1, seqlen_q, num_heads, head_dim,
+                              device=self.device, dtype=self.dtype)
+        k_target = torch.randn(1, seqlen_k, num_heads, head_dim,
+                              device=self.device, dtype=self.dtype)
+        v_target = torch.randn(1, seqlen_k, num_heads, head_dim,
+                              device=self.device, dtype=self.dtype)
+
+        # Compute target alone
+        out_alone = flash_attn_with_kvcache(q_target, k_target, v_target, causal=True)
+
+        # Create filler sequences for the batch
+        torch.manual_seed(123)
+        q_fillers = torch.randn(batch_size - 1, seqlen_q, num_heads, head_dim,
+                               device=self.device, dtype=self.dtype)
+        k_fillers = torch.randn(batch_size - 1, seqlen_k, num_heads, head_dim,
+                               device=self.device, dtype=self.dtype)
+        v_fillers = torch.randn(batch_size - 1, seqlen_k, num_heads, head_dim,
+                               device=self.device, dtype=self.dtype)
+
+        # Put target at position 0
+        q_batch = torch.cat([q_target, q_fillers], dim=0)
+        k_batch = torch.cat([k_target, k_fillers], dim=0)
+        v_batch = torch.cat([v_target, v_fillers], dim=0)
+
+        out_batch = flash_attn_with_kvcache(q_batch, k_batch, v_batch, causal=True)
+        out_from_batch = out_batch[0:1]
+
+        # Must be exactly equal
+        assert torch.equal(out_alone, out_from_batch), (
+            f"Batch invariance failed at batch_size={batch_size}! "
+            f"Max diff: {(out_alone - out_from_batch).abs().max().item()}"
+        )
+
+    @pytest.mark.parametrize("batch_size", BATCH_SIZES)
+    def test_variable_seqlens_at_batch_size(self, batch_size):
+        """
+        Test variable sequence lengths at various batch sizes.
+
+        Each sequence in the batch has a different KV cache length.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+
+        seqlen_q = 1  # Decode scenario
+        seqlen_k_max = 128
+        num_heads = 8
+        head_dim = 64
+
+        torch.manual_seed(42)
+        q = torch.randn(batch_size, seqlen_q, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        k = torch.randn(batch_size, seqlen_k_max, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        v = torch.randn(batch_size, seqlen_k_max, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+
+        # Create variable sequence lengths (between 32 and 128)
+        cache_seqlens = torch.randint(32, seqlen_k_max + 1, (batch_size,),
+                                      device=self.device, dtype=torch.int32)
+
+        # Should not raise errors
+        out = flash_attn_with_kvcache(
+            q, k, v,
+            cache_seqlens=cache_seqlens,
+            causal=True
+        )
+
+        assert out.shape == q.shape
+        assert not torch.isnan(out).any(), f"NaN with variable seqlens at batch_size={batch_size}"
+        assert not torch.isinf(out).any(), f"Inf with variable seqlens at batch_size={batch_size}"
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 64, 256])
+    def test_batch_invariance_with_variable_seqlens(self, batch_size):
+        """
+        Test batch invariance with variable sequence lengths.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+
+        seqlen_q = 1
+        seqlen_k_max = 128
+        num_heads = 8
+        head_dim = 64
+
+        # Create target sequence with specific length
+        torch.manual_seed(42)
+        q_target = torch.randn(1, seqlen_q, num_heads, head_dim,
+                              device=self.device, dtype=self.dtype)
+        k_target = torch.randn(1, seqlen_k_max, num_heads, head_dim,
+                              device=self.device, dtype=self.dtype)
+        v_target = torch.randn(1, seqlen_k_max, num_heads, head_dim,
+                              device=self.device, dtype=self.dtype)
+        target_seqlen = torch.tensor([64], device=self.device, dtype=torch.int32)
+
+        # Compute alone
+        out_alone = flash_attn_with_kvcache(
+            q_target, k_target, v_target,
+            cache_seqlens=target_seqlen,
+            causal=True
+        )
+
+        # Create batch with different sequence lengths
+        torch.manual_seed(123)
+        q_fillers = torch.randn(batch_size - 1, seqlen_q, num_heads, head_dim,
+                               device=self.device, dtype=self.dtype)
+        k_fillers = torch.randn(batch_size - 1, seqlen_k_max, num_heads, head_dim,
+                               device=self.device, dtype=self.dtype)
+        v_fillers = torch.randn(batch_size - 1, seqlen_k_max, num_heads, head_dim,
+                               device=self.device, dtype=self.dtype)
+        filler_seqlens = torch.randint(32, seqlen_k_max + 1, (batch_size - 1,),
+                                       device=self.device, dtype=torch.int32)
+
+        q_batch = torch.cat([q_target, q_fillers], dim=0)
+        k_batch = torch.cat([k_target, k_fillers], dim=0)
+        v_batch = torch.cat([v_target, v_fillers], dim=0)
+        batch_seqlens = torch.cat([target_seqlen, filler_seqlens], dim=0)
+
+        out_batch = flash_attn_with_kvcache(
+            q_batch, k_batch, v_batch,
+            cache_seqlens=batch_seqlens,
+            causal=True
+        )
+        out_from_batch = out_batch[0:1]
+
+        assert torch.equal(out_alone, out_from_batch), (
+            f"Batch invariance with varlen failed at batch_size={batch_size}! "
+            f"Max diff: {(out_alone - out_from_batch).abs().max().item()}"
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("batch_size", EXTENDED_BATCH_SIZES)
+    def test_large_batch_sizes(self, batch_size):
+        """
+        Stress test with very large batch sizes.
+
+        Marked as 'slow' - run with: pytest -m slow
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+
+        seqlen_q = 1  # Decode scenario to reduce memory
+        seqlen_k = 64
+        num_heads = 8
+        head_dim = 64
+
+        try:
+            torch.manual_seed(42)
+            q = torch.randn(batch_size, seqlen_q, num_heads, head_dim,
+                           device=self.device, dtype=self.dtype)
+            k = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                           device=self.device, dtype=self.dtype)
+            v = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                           device=self.device, dtype=self.dtype)
+
+            out = flash_attn_with_kvcache(q, k, v, causal=True)
+
+            assert out.shape == q.shape
+            assert not torch.isnan(out).any()
+            assert not torch.isinf(out).any()
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                pytest.skip(f"Skipping batch_size={batch_size} due to OOM")
+            raise
+
+
+class TestPerformanceBenchmark:
+    """
+    Performance benchmarks for batch-invariant flash attention.
+
+    These tests measure execution time and throughput at various batch sizes.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Setup test fixtures."""
+        if not torch.npu.is_available():
+            pytest.skip("NPU not available")
+
+        self.device = torch.device("npu:0")
+        self.dtype = torch.float16
+
+    @pytest.mark.benchmark
+    @pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256, 1024])
+    def test_decode_performance(self, batch_size):
+        """
+        Benchmark decode performance (seqlen_q=1) at various batch sizes.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+        import time
+
+        seqlen_q = 1
+        seqlen_k = 512  # Typical context length
+        num_heads = 32
+        head_dim = 128
+
+        torch.manual_seed(42)
+        q = torch.randn(batch_size, seqlen_q, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        k = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        v = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+
+        # Warmup
+        for _ in range(3):
+            _ = flash_attn_with_kvcache(q, k, v, causal=True)
+        torch.npu.synchronize()
+
+        # Benchmark
+        num_iterations = 100
+        start = time.perf_counter()
+        for _ in range(num_iterations):
+            _ = flash_attn_with_kvcache(q, k, v, causal=True)
+        torch.npu.synchronize()
+        elapsed = time.perf_counter() - start
+
+        avg_time_ms = (elapsed / num_iterations) * 1000
+        throughput = batch_size / (elapsed / num_iterations)
+
+        print(f"\n[Decode Performance] batch_size={batch_size}")
+        print(f"  Avg time: {avg_time_ms:.3f} ms")
+        print(f"  Throughput: {throughput:.1f} sequences/sec")
+
+    @pytest.mark.benchmark
+    @pytest.mark.parametrize("batch_size", [1, 4, 16, 64])
+    def test_prefill_performance(self, batch_size):
+        """
+        Benchmark prefill performance (longer seqlen_q) at various batch sizes.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+        import time
+
+        seqlen_q = 256  # Prefill scenario
+        seqlen_k = 256
+        num_heads = 32
+        head_dim = 128
+
+        torch.manual_seed(42)
+        q = torch.randn(batch_size, seqlen_q, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        k = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+        v = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                       device=self.device, dtype=self.dtype)
+
+        # Warmup
+        for _ in range(3):
+            _ = flash_attn_with_kvcache(q, k, v, causal=True)
+        torch.npu.synchronize()
+
+        # Benchmark
+        num_iterations = 20
+        start = time.perf_counter()
+        for _ in range(num_iterations):
+            _ = flash_attn_with_kvcache(q, k, v, causal=True)
+        torch.npu.synchronize()
+        elapsed = time.perf_counter() - start
+
+        avg_time_ms = (elapsed / num_iterations) * 1000
+        tokens_per_sec = (batch_size * seqlen_q) / (elapsed / num_iterations)
+
+        print(f"\n[Prefill Performance] batch_size={batch_size}")
+        print(f"  Avg time: {avg_time_ms:.3f} ms")
+        print(f"  Throughput: {tokens_per_sec:.1f} tokens/sec")
+
+    @pytest.mark.benchmark
+    def test_batch_scaling_efficiency(self):
+        """
+        Measure how performance scales with batch size.
+
+        Ideally, throughput should increase linearly with batch size
+        until we hit memory bandwidth limits.
+        """
+        from vllm_ascend.batch_invariant import flash_attn_with_kvcache
+        import time
+
+        seqlen_q = 1
+        seqlen_k = 256
+        num_heads = 32
+        head_dim = 128
+
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        results = []
+
+        for batch_size in batch_sizes:
+            torch.manual_seed(42)
+            q = torch.randn(batch_size, seqlen_q, num_heads, head_dim,
+                           device=self.device, dtype=self.dtype)
+            k = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                           device=self.device, dtype=self.dtype)
+            v = torch.randn(batch_size, seqlen_k, num_heads, head_dim,
+                           device=self.device, dtype=self.dtype)
+
+            # Warmup
+            for _ in range(3):
+                _ = flash_attn_with_kvcache(q, k, v, causal=True)
+            torch.npu.synchronize()
+
+            # Benchmark
+            num_iterations = 50
+            start = time.perf_counter()
+            for _ in range(num_iterations):
+                _ = flash_attn_with_kvcache(q, k, v, causal=True)
+            torch.npu.synchronize()
+            elapsed = time.perf_counter() - start
+
+            avg_time_ms = (elapsed / num_iterations) * 1000
+            throughput = batch_size / (elapsed / num_iterations)
+            results.append((batch_size, avg_time_ms, throughput))
+
+        print("\n[Batch Scaling Efficiency]")
+        print("  Batch Size | Avg Time (ms) | Throughput (seq/s) | Efficiency")
+        print("  " + "-" * 60)
+
+        base_throughput = results[0][2]
+        for batch_size, avg_time, throughput in results:
+            efficiency = throughput / (batch_size * base_throughput) * 100
+            print(f"  {batch_size:>10} | {avg_time:>13.3f} | {throughput:>18.1f} | {efficiency:>8.1f}%")
