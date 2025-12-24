@@ -52,20 +52,22 @@ class AscendRMSNorm(RMSNorm):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         import torch_npu
 
+        # RMSNorm inherently possesses batch invariance by default and is temporarily kept disabled.
+        use_batch_invariant_mode = Fasle # or use_batch_invariant_mode = vllm_is_batch_invariant()
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
         if residual is not None:
             if get_ascend_device_type() == AscendDeviceType._310P:
                 orig_dtype = residual.dtype
                 x = x + residual.to(x.dtype)
                 residual_out = x.to(orig_dtype)
-                if vllm_is_batch_invariant():
+                if use_batch_invariant_mode:
                     x_out = rms_norm_batch_invariant(x, self.weight,
                                                 self.variance_epsilon)
                 else:
                     x_out, _ = torch_npu.npu_rms_norm(x, self.weight,
                                                 self.variance_epsilon)
             else:
-                if vllm_is_batch_invariant():
+                if use_batch_invariant_mode:
                     residual_out = x + residual
                     x_out = rms_norm_batch_invariant(
                         x + residual,  self.weight, self.variance_epsilon
@@ -76,7 +78,7 @@ class AscendRMSNorm(RMSNorm):
                 if self.bias is not None:
                     x_out.add_(self.bias)
             return x_out, residual_out
-        if vllm_is_batch_invariant():
+        if use_batch_invariant_mode:
             x_out = rms_norm_batch_invariant(x, self.weight,
                                                     self.variance_epsilon)
         else:

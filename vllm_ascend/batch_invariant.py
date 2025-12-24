@@ -653,25 +653,25 @@ def enable_batch_invariant_mode():
 
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "NPU")
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "NPU")
-    _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant,
-                              "NPU")
+    # _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "NPU")
+    # _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "NPU")
+    # _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant,
+    #                           "NPU")
     _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant,
                               "NPU")
-    _batch_invariant_LIB.impl("aten::_log_softmax",
-                              _log_softmax_batch_invariant, "NPU")
-    _batch_invariant_LIB.impl("aten::softmax", softmax_batch_invariant,
-                              "NPU")
-    _batch_invariant_LIB.impl("aten::_softmax", softmax_batch_invariant,
-                              "NPU")
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant,
-                              "NPU")
+    # _batch_invariant_LIB.impl("aten::_log_softmax",
+    #                           _log_softmax_batch_invariant, "NPU")
+    # _batch_invariant_LIB.impl("aten::softmax", softmax_batch_invariant,
+    #                           "NPU")
+    # _batch_invariant_LIB.impl("aten::_softmax", softmax_batch_invariant,
+    #                           "NPU")
+    # _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant,
+    #                           "NPU")
 
     # Also monkeypatch torch.bmm directly as a fallback
-    _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "NPU")
-    _original_torch_bmm = torch.bmm
-    torch.bmm = bmm_batch_invariant
+    # _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "NPU")
+    # _original_torch_bmm = torch.bmm
+    # torch.bmm = bmm_batch_invariant
 
 
 
@@ -699,15 +699,6 @@ def override_envs_for_invariance():
     os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
     os.environ["ATB_MATMUL_SHUFFLE_K_ENABLE"] = "0"
     os.environ["ATB_LLM_LCOC_ENABLE"] = "0"
-
-
-
-def init_batch_invariance():
-    # this will hit all the csrc overrides as well
-    if vllm_is_batch_invariant():
-        override_envs_for_invariance()
-        enable_batch_invariant_mode()
-
 
 # =============================================================================
 # Batch-Invariant Flash Attention with KV Cache
@@ -1279,10 +1270,6 @@ def disable_batch_invariant_flash_attention():
             pass
 
 
-# Update init_batch_invariance to also enable batch-invariant flash attention
-_original_init_batch_invariance = init_batch_invariance
-
-
 def init_batch_invariance():
     """
     Initialize batch-invariant mode for vLLM on Ascend NPU.
@@ -1295,8 +1282,8 @@ def init_batch_invariance():
     Call this function early in your application, or set VLLM_BATCH_INVARIANT=1
     environment variable to enable automatically.
     """
-    _original_init_batch_invariance()
-
-    # Also enable batch-invariant flash attention
     if vllm_is_batch_invariant():
+        override_envs_for_invariance()
+        enable_batch_invariant_mode()
         enable_batch_invariant_flash_attention()
+
