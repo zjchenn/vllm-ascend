@@ -757,6 +757,8 @@ def _flash_attn_with_kvcache_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr,
     # Softmax LSE output (optional)
     LSE_ptr,
+    # Cache sequence lengths pointer (for variable length sequences)
+    Cache_seqlens_ptr,
     # Dimensions
     batch_size, seqlen_q, seqlen_k, num_heads_q, num_heads_k, head_dim,
     # Strides for Q: (batch, seqlen, heads, head_dim)
@@ -783,6 +785,8 @@ def _flash_attn_with_kvcache_kernel(
     HEAD_DIM: tl.constexpr,
     # Whether to output LSE
     WRITE_LSE: tl.constexpr,
+    # Whether to use variable sequence lengths
+    USE_VARLEN: tl.constexpr,
 ):
     """
     Batch-invariant Flash Attention forward kernel.
@@ -791,6 +795,9 @@ def _flash_attn_with_kvcache_kernel(
 
     This kernel processes one block of queries per program, ensuring that
     each (batch, head) pair is processed independently for batch invariance.
+
+    When USE_VARLEN=True, each sequence can have different K/V lengths,
+    read from Cache_seqlens_ptr[batch_idx].
     """
     # Get program IDs - this is the key to batch invariance
     # Each (batch, head) pair gets its own independent computation
@@ -802,6 +809,13 @@ def _flash_attn_with_kvcache_kernel(
     # For standard attention: gqa_ratio = 1
     # For GQA: gqa_ratio = num_heads_q // num_heads_k > 1
     kv_head_idx = pid_h // gqa_ratio
+
+    # Get the actual seqlen_k for this batch element
+    if USE_VARLEN:
+        # Read sequence length for this batch element
+        actual_seqlen_k = tl.load(Cache_seqlens_ptr + pid_b)
+    else:
+        actual_seqlen_k = seqlen_k
 
     # Compute starting positions
     q_start = pid_m * BLOCK_M
@@ -832,14 +846,14 @@ def _flash_attn_with_kvcache_kernel(
     # For causal masking, we only need to iterate up to the diagonal
     # Note: Causal mask is aligned to bottom-right corner of attention matrix
     # This means query at position i can attend to keys at positions <= i + (seqlen_k - seqlen_q)
-    causal_offset = seqlen_k - seqlen_q  # Offset for bottom-right alignment
+    causal_offset = actual_seqlen_k - seqlen_q  # Offset for bottom-right alignment
 
     if is_causal:
         # For causal attention, the last valid K position for query at position q_pos
         # is q_pos + causal_offset (aligned to bottom-right corner of attention matrix)
-        kv_len = tl.minimum(seqlen_k, q_start + BLOCK_M + causal_offset)
+        kv_len = tl.minimum(actual_seqlen_k, q_start + BLOCK_M + causal_offset)
     else:
-        kv_len = seqlen_k
+        kv_len = actual_seqlen_k
 
     num_kv_blocks = tl.cdiv(kv_len, BLOCK_N)
 
@@ -855,7 +869,7 @@ def _flash_attn_with_kvcache_kernel(
                        offs_d[:, None] * stride_kd)
 
         # Load K block: [HEAD_DIM, BLOCK_N]
-        k_mask = (offs_kv[None, :] < seqlen_k) & (offs_d[:, None] < head_dim)
+        k_mask = (offs_kv[None, :] < actual_seqlen_k) & (offs_d[:, None] < head_dim)
         k = tl.load(K_block_ptr, mask=k_mask, other=0.0).to(tl.float32)
 
         # Compute attention scores: Q @ K^T -> [BLOCK_M, BLOCK_N]
@@ -876,8 +890,8 @@ def _flash_attn_with_kvcache_kernel(
             causal_mask = (offs_m[:, None] + causal_offset) >= offs_kv[None, :]
             scores = tl.where(causal_mask, scores, float("-inf"))
 
-        # Apply boundary mask for keys beyond seqlen_k
-        boundary_mask = offs_kv[None, :] < seqlen_k
+        # Apply boundary mask for keys beyond actual_seqlen_k
+        boundary_mask = offs_kv[None, :] < actual_seqlen_k
         scores = tl.where(boundary_mask, scores, float("-inf"))
 
         # Online softmax update (numerically stable)
@@ -899,7 +913,7 @@ def _flash_attn_with_kvcache_kernel(
                        kv_head_idx * stride_vh +
                        offs_d[None, :] * stride_vd)
 
-        v_mask = (offs_kv[:, None] < seqlen_k) & (offs_d[None, :] < head_dim)
+        v_mask = (offs_kv[:, None] < actual_seqlen_k) & (offs_d[None, :] < head_dim)
         v = tl.load(V_block_ptr, mask=v_mask, other=0.0).to(tl.float32)
 
         # Update output accumulator
@@ -1099,84 +1113,52 @@ def flash_attn_with_kvcache(
     # Round up head_dim to power of 2 for efficiency
     HEAD_DIM_PADDED = triton.next_power_of_2(head_dim)
 
-    # Handle variable sequence lengths by processing each batch element separately
-    # This ensures batch invariance when sequences have different lengths
+    # Compute grid dimensions
+    # Grid: (num_q_blocks, batch_size, num_heads_q)
+    # This ensures batch invariance: each (batch, head) pair is independent
+    num_q_blocks = triton.cdiv(seqlen_q, BLOCK_M)
+    grid = (num_q_blocks, batch_size, num_heads_q)
+
+    # Prepare cache_seqlens tensor for kernel
+    # If variable_seqlens, use the actual tensor; otherwise create a dummy
     if variable_seqlens:
-        for b in range(batch_size):
-            seq_len_k = cache_seqlens_tensor[b].item()
-
-            # Compute grid dimensions for this single sequence
-            num_q_blocks = triton.cdiv(seqlen_q, BLOCK_M)
-            grid = (num_q_blocks, 1, num_heads_q)
-
-            # Launch kernel for this sequence
-            _flash_attn_with_kvcache_kernel[grid](
-                # Pointers - offset by batch index
-                q[b:b+1], k_cache[b:b+1], v_cache[b:b+1], out[b:b+1],
-                softmax_lse[b:b+1] if return_softmax_lse else softmax_lse,
-                # Dimensions
-                1, seqlen_q, seq_len_k, num_heads_q, num_heads_k, head_dim,
-                # Q strides (for batch size 1)
-                q[b:b+1].stride(0), q[b:b+1].stride(1), q[b:b+1].stride(2), q[b:b+1].stride(3),
-                # K strides
-                k_cache[b:b+1].stride(0), k_cache[b:b+1].stride(1), k_cache[b:b+1].stride(2), k_cache[b:b+1].stride(3),
-                # V strides
-                v_cache[b:b+1].stride(0), v_cache[b:b+1].stride(1), v_cache[b:b+1].stride(2), v_cache[b:b+1].stride(3),
-                # O strides
-                out[b:b+1].stride(0), out[b:b+1].stride(1), out[b:b+1].stride(2), out[b:b+1].stride(3),
-                # LSE strides
-                softmax_lse[b:b+1].stride(0) if return_softmax_lse else 0,
-                softmax_lse[b:b+1].stride(1) if return_softmax_lse else 0,
-                softmax_lse[b:b+1].stride(2) if return_softmax_lse else 1,
-                # Attention parameters
-                softmax_scale,
-                causal,
-                softcap,
-                gqa_ratio,
-                # Block sizes
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                HEAD_DIM=HEAD_DIM_PADDED,
-                WRITE_LSE=return_softmax_lse,
-            )
+        cache_seqlens_for_kernel = cache_seqlens_tensor
     else:
-        # All sequences have the same length - can process in parallel
-        # Compute grid dimensions
-        # Grid: (num_q_blocks, batch_size, num_heads_q)
-        # This ensures batch invariance: each (batch, head) pair is independent
-        num_q_blocks = triton.cdiv(seqlen_q, BLOCK_M)
-        grid = (num_q_blocks, batch_size, num_heads_q)
+        # Create a dummy tensor (won't be read because USE_VARLEN=False)
+        cache_seqlens_for_kernel = torch.empty(0, dtype=torch.int32, device=q.device)
 
-        # Launch kernel
-        _flash_attn_with_kvcache_kernel[grid](
-            # Pointers
-            q, k_cache, v_cache, out,
-            softmax_lse,
-            # Dimensions
-            batch_size, seqlen_q, effective_seqlen_k, num_heads_q, num_heads_k, head_dim,
-            # Q strides
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            # K strides
-            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
-            # V strides
-            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
-            # O strides
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            # LSE strides
-            softmax_lse.stride(0) if return_softmax_lse else 0,
-            softmax_lse.stride(1) if return_softmax_lse else 0,
-            softmax_lse.stride(2) if return_softmax_lse else 1,
-            # Attention parameters
-            softmax_scale,
-            causal,
-            softcap,
-            gqa_ratio,
-            # Block sizes
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            HEAD_DIM=HEAD_DIM_PADDED,
-            WRITE_LSE=return_softmax_lse,
-        )
+    # Launch kernel - single call for entire batch
+    _flash_attn_with_kvcache_kernel[grid](
+        # Pointers
+        q, k_cache, v_cache, out,
+        softmax_lse,
+        cache_seqlens_for_kernel,
+        # Dimensions
+        batch_size, seqlen_q, effective_seqlen_k, num_heads_q, num_heads_k, head_dim,
+        # Q strides
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        # K strides
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        # V strides
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        # O strides
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        # LSE strides
+        softmax_lse.stride(0) if return_softmax_lse else 0,
+        softmax_lse.stride(1) if return_softmax_lse else 0,
+        softmax_lse.stride(2) if return_softmax_lse else 1,
+        # Attention parameters
+        softmax_scale,
+        causal,
+        softcap,
+        gqa_ratio,
+        # Block sizes
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        HEAD_DIM=HEAD_DIM_PADDED,
+        WRITE_LSE=return_softmax_lse,
+        USE_VARLEN=variable_seqlens,
+    )
 
     if return_softmax_lse:
         return out, softmax_lse

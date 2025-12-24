@@ -666,9 +666,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # We need to gather the relevant blocks for each sequence
         block_tables = attn_metadata.block_tables  # [batch_size, max_blocks]
 
-        # For simplicity in batch-invariant mode, we'll process each sequence
-        # independently. This ensures batch invariance at the cost of parallelism.
-        # TODO: Optimize this with a proper paged attention kernel
         max_seq_len = seq_lens.max().item()
         block_size = self.key_cache.shape[1]
 
@@ -683,19 +680,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
             dtype=query.dtype, device=query.device
         )
 
-        # Gather KV cache for each sequence
+        # Gather KV cache for each sequence using vectorized block indexing
+        # This eliminates the inner block loop
         for b in range(batch_size):
             seq_len = seq_lens[b].item()
             num_blocks_needed = (seq_len + block_size - 1) // block_size
 
-            for block_idx in range(num_blocks_needed):
-                block_num = block_tables[b, block_idx].item()
-                start_pos = block_idx * block_size
-                end_pos = min(start_pos + block_size, seq_len)
-                actual_len = end_pos - start_pos
+            # Get all block indices for this sequence at once
+            block_nums = block_tables[b, :num_blocks_needed]  # [num_blocks]
 
-                k_gathered[b, start_pos:end_pos] = self.key_cache[block_num, :actual_len]
-                v_gathered[b, start_pos:end_pos] = self.value_cache[block_num, :actual_len]
+            # Gather all blocks at once using advanced indexing
+            # Shape: [num_blocks, block_size, num_kv_heads, head_size]
+            k_blocks = self.key_cache[block_nums]
+            v_blocks = self.value_cache[block_nums]
+
+            # Reshape to [num_blocks * block_size, num_kv_heads, head_size] and truncate
+            k_flat = k_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:seq_len]
+            v_flat = v_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:seq_len]
+
+            k_gathered[b, :seq_len] = k_flat
+            v_gathered[b, :seq_len] = v_flat
 
         # Call batch-invariant flash attention
         # Note: cache_seqlens tells the kernel the actual sequence lengths
@@ -834,6 +838,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_seqs = len(query_start_loc)
 
         # Process each sequence independently
+        # Note: For prefill with variable Q lengths, we still need per-sequence processing
+        # because Q and K/V lengths differ per sequence
         prev_q_end = 0
         for seq_idx in range(num_seqs):
             q_end = query_start_loc[seq_idx]
@@ -847,28 +853,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # Extract Q for this sequence
             q_seq = query[prev_q_end:q_end]  # [q_len, num_heads, head_size]
 
-            # Gather K/V from paged cache for this sequence
+            # Gather K/V from paged cache using vectorized block indexing
             num_blocks_needed = (kv_len + block_size - 1) // block_size
 
-            # Allocate contiguous K/V tensors
-            k_gathered = torch.zeros(
-                kv_len, self.num_kv_heads, self.head_size,
-                dtype=query.dtype, device=query.device
-            )
-            v_gathered = torch.zeros(
-                kv_len, self.num_kv_heads, self.head_size,
-                dtype=query.dtype, device=query.device
-            )
+            # Get all block indices for this sequence at once
+            block_nums = block_tables[seq_idx, :num_blocks_needed]  # [num_blocks]
 
-            # Gather from paged blocks
-            for block_idx in range(num_blocks_needed):
-                block_num = block_tables[seq_idx, block_idx].item()
-                start_pos = block_idx * block_size
-                end_pos = min(start_pos + block_size, kv_len)
-                actual_len = end_pos - start_pos
+            # Gather all blocks at once using advanced indexing
+            # Shape: [num_blocks, block_size, num_kv_heads, head_size]
+            k_blocks = self.key_cache[block_nums]
+            v_blocks = self.value_cache[block_nums]
 
-                k_gathered[start_pos:end_pos] = self.key_cache[block_num, :actual_len]
-                v_gathered[start_pos:end_pos] = self.value_cache[block_num, :actual_len]
+            # Reshape to [num_blocks * block_size, num_kv_heads, head_size] and truncate
+            k_gathered = k_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:kv_len]
+            v_gathered = v_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:kv_len]
 
             # Convert to BSHD: [1, seq_len, num_heads, head_size]
             q_bshd = q_seq.unsqueeze(0)
