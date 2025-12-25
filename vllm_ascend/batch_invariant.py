@@ -9,8 +9,7 @@ import torch
 
 from vllm.triton_utils import triton, tl
 from vllm.model_executor.layers.batch_invariant import (
-     _log_softmax_batch_invariant,
-    softmax_batch_invariant)
+     _log_softmax_batch_invariant)
 
 import triton.runtime.driver as driver
 
