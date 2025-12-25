@@ -21,9 +21,7 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 @pytest.fixture(autouse=True)
 def enable_batch_invariant_mode(monkeypatch: pytest.MonkeyPatch):
     """Automatically enable batch invariant kernel overrides for all tests."""
-    # monkeypatch.setattr(batch_invariant, "VLLM_BATCH_INVARIANT", True)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    monkeypatch.setenv("VLLM_ASCEND_ENABLE_NZ", "0")
 
 def _random_prompt(min_words: int = 1024, max_words: int = 1024 * 2) -> str:
     # Generate more realistic prompts that will actually produce varied tokens
@@ -137,8 +135,6 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
     top_p = float(os.getenv("VLLM_NEEDLE_TOP_P", "0.95"))
     max_tokens = int(os.getenv("VLLM_NEEDLE_MAX_TOKENS", "35"))
 
-    # monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-
     sampling = SamplingParams(
         temperature=temperature,
         top_p=top_p,
@@ -156,6 +152,13 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
             max_num_seqs=max_batch_size,
             gpu_memory_utilization=gpu_mem_util,
             max_model_len=max_model_len,
+            dtype="bfloat16",
+            tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
+            enable_prefix_caching=False,
+            enforce_eager=True,
+            distributed_executor_backend="mp",
+            # Enable for MOE models
+            # enable_expert_parallel=True,
         )
 
         # Baseline generation for the needle prompt alone.

@@ -690,6 +690,9 @@ def vllm_is_batch_invariant():
 def override_envs_for_invariance():
     # TODO(Ronald) set attntion backend to deterministic mode
 
+    # enabling NZ mode introduces NZ format input to the triton operator,
+    # resulting in accuracy anomalies.
+    os.environ["VLLM_ASCEND_ENABLE_NZ"] = "0"
 
     # communication determinism settings
     os.environ["HCCL_DETERMINISTIC"] = "true"
