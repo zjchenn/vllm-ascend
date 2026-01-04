@@ -53,7 +53,7 @@ class AscendRMSNorm(RMSNorm):
         import torch_npu
 
         # RMSNorm inherently possesses batch invariance by default and is temporarily kept disabled.
-        use_batch_invariant_mode = Fasle # or use_batch_invariant_mode = vllm_is_batch_invariant()
+        use_batch_invariant_mode = False # or use_batch_invariant_mode = vllm_is_batch_invariant()
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
         if residual is not None:
             if get_ascend_device_type() == AscendDeviceType._310P:
