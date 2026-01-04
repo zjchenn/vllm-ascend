@@ -787,6 +787,8 @@ def _flash_attn_with_kvcache_kernel(
     WRITE_LSE: tl.constexpr,
     # Whether to use variable sequence lengths
     USE_VARLEN: tl.constexpr,
+    # Maximum number of KV blocks (compile-time constant for loop bound)
+    MAX_KV_BLOCKS: tl.constexpr,
 ):
     """
     Batch-invariant Flash Attention forward kernel.
@@ -797,7 +799,8 @@ def _flash_attn_with_kvcache_kernel(
     each (batch, head) pair is processed independently for batch invariance.
 
     When USE_VARLEN=True, each sequence can have different K/V lengths,
-    read from Cache_seqlens_ptr[batch_idx].
+    read from Cache_seqlens_ptr[batch_idx]. The loop iterates over MAX_KV_BLOCKS
+    (compile-time constant) and uses boundary masking to handle actual lengths.
     """
     # Get program IDs - this is the key to batch invariance
     # Each (batch, head) pair gets its own independent computation
@@ -842,24 +845,26 @@ def _flash_attn_with_kvcache_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)  # Sum of exp(scores)
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)  # Max score
 
-    # Iterate over K/V blocks
-    # For causal masking, we only need to iterate up to the diagonal
-    # Note: Causal mask is aligned to bottom-right corner of attention matrix
-    # This means query at position i can attend to keys at positions <= i + (seqlen_k - seqlen_q)
-    causal_offset = actual_seqlen_k - seqlen_q  # Offset for bottom-right alignment
+    # Causal offset for bottom-right alignment of causal mask
+    # Note: actual_seqlen_k may be runtime value for varlen, but causal_offset
+    # is only used for masking, not for loop bounds
+    causal_offset = actual_seqlen_k - seqlen_q
 
-    if is_causal:
-        # For causal attention, the last valid K position for query at position q_pos
-        # is q_pos + causal_offset (aligned to bottom-right corner of attention matrix)
-        kv_len = tl.minimum(actual_seqlen_k, q_start + BLOCK_M + causal_offset)
-    else:
-        kv_len = actual_seqlen_k
-
-    num_kv_blocks = tl.cdiv(kv_len, BLOCK_N)
-
-    for kv_block_idx in range(num_kv_blocks):
+    # Iterate over K/V blocks using compile-time constant MAX_KV_BLOCKS
+    # For variable length sequences, we iterate over all possible blocks
+    # and use masking to skip blocks beyond actual_seqlen_k
+    for kv_block_idx in range(MAX_KV_BLOCKS):
         k_start = kv_block_idx * BLOCK_N
         offs_kv = k_start + offs_n
+
+        # Early exit check: if all positions in this block are beyond actual_seqlen_k,
+        # we can skip the computation (but still need to iterate due to compile-time loop)
+        # For non-varlen case with causal, we can also skip blocks beyond the diagonal
+        block_start_valid = k_start < actual_seqlen_k
+        if is_causal:
+            # For causal, also check if this block is beyond the causal boundary
+            causal_boundary = q_start + BLOCK_M + causal_offset
+            block_start_valid = block_start_valid & (k_start < causal_boundary)
 
         # Compute K pointer for this (batch, kv_head, kv_block)
         K_block_ptr = (K_ptr +
@@ -869,6 +874,7 @@ def _flash_attn_with_kvcache_kernel(
                        offs_d[:, None] * stride_kd)
 
         # Load K block: [HEAD_DIM, BLOCK_N]
+        # Mask out positions beyond actual_seqlen_k
         k_mask = (offs_kv[None, :] < actual_seqlen_k) & (offs_d[:, None] < head_dim)
         k = tl.load(K_block_ptr, mask=k_mask, other=0.0).to(tl.float32)
 
@@ -884,9 +890,6 @@ def _flash_attn_with_kvcache_kernel(
         if is_causal:
             # Causal mask: query at position i can only attend to keys at positions <= i + offset
             # This aligns the mask to the bottom-right corner of the attention matrix
-            # Example: if seqlen_q=2, seqlen_k=5, offset=3
-            #   Q0 can attend to K0,K1,K2,K3 (positions <= 0+3)
-            #   Q1 can attend to K0,K1,K2,K3,K4 (positions <= 1+3)
             causal_mask = (offs_m[:, None] + causal_offset) >= offs_kv[None, :]
             scores = tl.where(causal_mask, scores, float("-inf"))
 
@@ -1119,6 +1122,12 @@ def flash_attn_with_kvcache(
     num_q_blocks = triton.cdiv(seqlen_q, BLOCK_M)
     grid = (num_q_blocks, batch_size, num_heads_q)
 
+    # Compute MAX_KV_BLOCKS as compile-time constant
+    # This is the maximum number of KV blocks we need to iterate over
+    # For variable length sequences, we use seqlen_k (the tensor dimension)
+    # as the upper bound, and mask out invalid positions in the kernel
+    max_kv_blocks = triton.cdiv(seqlen_k, BLOCK_N)
+
     # Prepare cache_seqlens tensor for kernel
     # If variable_seqlens, use the actual tensor; otherwise create a dummy
     if variable_seqlens:
@@ -1152,12 +1161,13 @@ def flash_attn_with_kvcache(
         causal,
         softcap,
         gqa_ratio,
-        # Block sizes
+        # Block sizes and loop bounds
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HEAD_DIM=HEAD_DIM_PADDED,
         WRITE_LSE=return_softmax_lse,
         USE_VARLEN=variable_seqlens,
+        MAX_KV_BLOCKS=max_kv_blocks,
     )
 
     if return_softmax_lse:

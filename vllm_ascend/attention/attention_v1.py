@@ -736,7 +736,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         This method handles different attention states:
         - PrefillNoCache: Q, K, V all come from input (same length)
-        - PrefillCacheHit/ChunkedPrefill: Q from input, K/V from KV cache (different lengths)
+        - PrefillCacheHit: Q from input, K/V from KV cache (different lengths)
+        - ChunkedPrefill: Q from input (chunk), K/V from KV cache (full context)
+        - SpecDecoding: Similar to ChunkedPrefill with speculative tokens
 
         Args:
             query: [num_tokens, num_heads, head_size] in TND layout
@@ -748,18 +750,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
-        # Determine if we need to read from KV cache
-        use_kv_cache = attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+        # Determine the attention state and corresponding K/V source
+        attn_state = attn_metadata.attn_state
 
-        if use_kv_cache and self.key_cache is not None:
-            # ChunkedPrefill or PrefillCacheHit: K/V come from cache
-            return self._forward_prefill_with_cache_batch_invariant(
-                query, attn_metadata, output
-            )
-        else:
+        if attn_state == AscendAttentionState.PrefillNoCache:
             # PrefillNoCache: K/V come from input (same length as Q)
             return self._forward_prefill_no_cache_batch_invariant(
                 query, key, value, attn_metadata, output
+            )
+        else:
+            # PrefillCacheHit, ChunkedPrefill, SpecDecoding: K/V come from cache
+            # Need to handle block_table and actual_seq_lengths_kv appropriately
+            return self._forward_prefill_with_cache_batch_invariant(
+                query, attn_metadata, output
             )
 
     def _forward_prefill_no_cache_batch_invariant(
@@ -823,19 +826,37 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Batch-invariant prefill with KV cache (chunked prefill or cache hit).
+        Batch-invariant prefill with KV cache (chunked prefill, cache hit, or spec decoding).
         Q length may differ from K/V length.
         K/V must be gathered from paged KV cache.
+
+        This method mirrors the original _forward_prefill logic for determining
+        actual_seq_lengths_kv based on the attention state:
+        - PrefillCacheHit: Use seq_lens_list, truncate block_tables to batch_size
+        - ChunkedPrefill/SpecDecoding: Use seq_lens_list, use full block_tables
         """
+        # Get attention state to determine how to handle block_tables and seq_lens
+        attn_state = attn_metadata.attn_state
+
         # Get sequence info
         # query_start_loc_list: cumulative Q token positions [q_end_0, q_end_1, ...]
-        # seq_lens_list: K/V lengths for each sequence [kv_len_0, kv_len_1, ...]
         query_start_loc = attn_metadata.query_start_loc_list
-        kv_seq_lens = attn_metadata.seq_lens_list
-        block_tables = attn_metadata.block_tables
-        block_size = self.key_cache.shape[1]
-
         num_seqs = len(query_start_loc)
+
+        # Determine block_tables and kv_seq_lens based on state
+        # This mirrors the logic in _forward_prefill
+        if attn_state == AscendAttentionState.PrefillCacheHit:
+            # For PrefillCacheHit, truncate block_tables to batch_size
+            batch_size = attn_metadata.query_lens.shape[0]
+            block_tables = attn_metadata.block_tables[:batch_size, :]
+            kv_seq_lens = attn_metadata.seq_lens_list[:batch_size]
+            num_seqs = batch_size
+        else:
+            # ChunkedPrefill, SpecDecoding: use full block_tables
+            block_tables = attn_metadata.block_tables
+            kv_seq_lens = attn_metadata.seq_lens_list
+
+        block_size = self.key_cache.shape[1]
 
         # Process each sequence independently
         # Note: For prefill with variable Q lengths, we still need per-sequence processing
