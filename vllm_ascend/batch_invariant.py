@@ -880,10 +880,10 @@ def flash_attn_with_kvcache(
         v_cache_npu = v_cache.reshape(num_blocks, block_size, -1).contiguous()
         block_table = page_table
     else:
-        # Non-paged: need to create a simple block mapping
-        # Reshape to (batch * ceil(seqlen_k/block_size), block_size, num_kv_heads * head_dim)
-        k_cache_npu = k_cache.reshape(-1, num_heads_k * head_dim).contiguous()
-        v_cache_npu = v_cache.reshape(-1, num_heads_k * head_dim).contiguous()
+        # Non-paged: K and V in BSHD format, reshape to TND format
+        # (batch_size, seqlen_k, num_kv_heads, head_dim) -> (total_tokens, num_kv_heads, head_dim)
+        k_cache_npu = k_cache.reshape(-1, num_heads_k, head_dim).contiguous()
+        v_cache_npu = v_cache.reshape(-1, num_heads_k, head_dim).contiguous()
         block_table = None
 
     # Allocate output tensor
