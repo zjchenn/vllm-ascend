@@ -630,8 +630,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
     # =========================================================================
     # Batch-Invariant Attention Methods
     # =========================================================================
-    # These methods use the batch-invariant Triton flash attention kernel
-    # to ensure deterministic results regardless of batch composition.
+    # These methods use the batch-invariant NPU flash attention with paged KV
+    # cache to ensure deterministic results regardless of batch composition.
     # =========================================================================
 
     def _forward_decode_only_batch_invariant(
@@ -640,51 +640,33 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Batch-invariant decode-only attention using Triton flash attention."""
+        """Batch-invariant decode-only attention using NPU paged attention."""
         batch_size = attn_metadata.seq_lens.shape[0]
         seq_lens = attn_metadata.seq_lens
         block_tables = attn_metadata.block_tables
-        block_size = self.key_cache.shape[1]
 
-        # Reshape Q: TND -> BSHD [batch_size, 1, num_heads, head_size]
-        q_bshd = query[:batch_size].view(batch_size, 1, self.num_heads, self.head_size)
+        # Reshape Q: TND -> (T, H, D) for varlen mode
+        q_tnd = query[:batch_size].contiguous()
 
-        # Allocate contiguous KV tensors
-        max_seq_len = seq_lens.max().item()
-        k_gathered = torch.zeros(
-            batch_size, max_seq_len, self.num_kv_heads, self.head_size,
-            dtype=query.dtype, device=query.device
-        )
-        v_gathered = torch.zeros(
-            batch_size, max_seq_len, self.num_kv_heads, self.head_size,
-            dtype=query.dtype, device=query.device
+        # Create cu_seqlens_q for decode (each query is 1 token)
+        cu_seqlens_q = torch.arange(
+            0, batch_size + 1,
+            dtype=torch.int32, device=query.device
         )
 
-        # Gather KV cache for each sequence
-        for b in range(batch_size):
-            seq_len = seq_lens[b].item()
-            if seq_len == 0:
-                continue
-
-            num_blocks_needed = (seq_len + block_size - 1) // block_size
-            block_nums = block_tables[b, :num_blocks_needed]
-
-            # Gather blocks and truncate to actual seq_len
-            k_blocks = self.key_cache[block_nums]
-            v_blocks = self.value_cache[block_nums]
-            k_gathered[b, :seq_len] = k_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:seq_len]
-            v_gathered[b, :seq_len] = v_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:seq_len]
-
-        # Call batch-invariant flash attention
+        # Call batch-invariant flash attention with paged KV cache
         attn_output = flash_attn_with_kvcache(
-            q_bshd, k_gathered, v_gathered,
+            q_tnd,
+            self.key_cache,
+            self.value_cache,
             cache_seqlens=seq_lens.int(),
+            page_table=block_tables,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
             causal=True,
             softmax_scale=self.scale,
         )
 
-        # Convert back: BSHD -> TND
-        attn_output = attn_output.view(batch_size, self.num_heads, self.head_size)
         output[:batch_size] = attn_output
         return output
 
@@ -696,7 +678,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Batch-invariant prefill attention using Triton flash attention."""
+        """Batch-invariant prefill attention using NPU attention."""
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             return self._forward_prefill_no_cache_batch_invariant(
                 query, key, value, attn_metadata, output
@@ -715,27 +697,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Batch-invariant prefill without KV cache (first prefill)."""
-        query_start_loc = attn_metadata.query_start_loc_list
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens].contiguous()
+        key = key[:num_tokens].contiguous()
+        value = value[:num_tokens].contiguous()
 
-        prev_end = 0
-        for seq_idx in range(len(query_start_loc)):
-            seq_end = query_start_loc[seq_idx]
-            seq_len = seq_end - prev_end
-            if seq_len == 0:
-                prev_end = seq_end
-                continue
+        # Create cu_seqlens from query_start_loc
+        cu_seqlens_q = torch.tensor(
+            [0] + attn_metadata.actual_seq_lengths_q,
+            dtype=torch.int32, device=query.device
+        )
 
-            # Process each sequence independently
-            attn_output = flash_attn_with_kvcache(
-                query[prev_end:seq_end].unsqueeze(0),
-                key[prev_end:seq_end].unsqueeze(0),
-                value[prev_end:seq_end].unsqueeze(0),
-                causal=True,
-                softmax_scale=self.scale,
-            )
-            output[prev_end:seq_end] = attn_output.squeeze(0)
-            prev_end = seq_end
+        # For no-cache prefill, K and V are the same shape as Q
+        # Use NPU fused attention directly
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key.reshape(-1, self.num_kv_heads * self.head_size),
+            value=value.reshape(-1, self.num_kv_heads * self.head_size),
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="TND",
+            block_size=128,
+            scale=self.scale,
+            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv=attn_metadata.actual_seq_lengths_q,
+            sparse_mode=3,  # causal
+        )
 
+        output[:num_tokens] = attn_output
         return output
 
     def _forward_prefill_with_cache_batch_invariant(
@@ -744,52 +733,41 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Batch-invariant prefill with KV cache."""
+        """Batch-invariant prefill with paged KV cache."""
         attn_state = attn_metadata.attn_state
-        query_start_loc = attn_metadata.query_start_loc_list
-        block_size = self.key_cache.shape[1]
 
         # Determine block_tables and kv_seq_lens based on state
         if attn_state == AscendAttentionState.PrefillCacheHit:
             batch_size = attn_metadata.query_lens.shape[0]
             block_tables = attn_metadata.block_tables[:batch_size, :]
             kv_seq_lens = attn_metadata.seq_lens_list[:batch_size]
-            num_seqs = batch_size
         else:
             block_tables = attn_metadata.block_tables
             kv_seq_lens = attn_metadata.seq_lens_list
-            num_seqs = len(query_start_loc)
 
-        prev_q_end = 0
-        for seq_idx in range(num_seqs):
-            q_end = query_start_loc[seq_idx]
-            q_len = q_end - prev_q_end
-            kv_len = kv_seq_lens[seq_idx]
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens].contiguous()
 
-            if q_len == 0 or kv_len == 0:
-                prev_q_end = q_end
-                continue
+        # Create cu_seqlens from query_start_loc
+        cu_seqlens_q = torch.tensor(
+            [0] + attn_metadata.actual_seq_lengths_q,
+            dtype=torch.int32, device=query.device
+        )
 
-            # Gather K/V from paged cache
-            num_blocks_needed = (kv_len + block_size - 1) // block_size
-            block_nums = block_tables[seq_idx, :num_blocks_needed]
+        # Call batch-invariant flash attention with paged KV cache
+        attn_output = flash_attn_with_kvcache(
+            query,
+            self.key_cache,
+            self.value_cache,
+            cache_seqlens=torch.tensor(kv_seq_lens, dtype=torch.int32, device=query.device),
+            page_table=block_tables,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=attn_metadata.max_query_len,
+            causal=True,
+            softmax_scale=self.scale,
+        )
 
-            k_blocks = self.key_cache[block_nums]
-            v_blocks = self.value_cache[block_nums]
-            k_gathered = k_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:kv_len]
-            v_gathered = v_blocks.reshape(-1, self.num_kv_heads, self.head_size)[:kv_len]
-
-            # Call batch-invariant flash attention
-            attn_output = flash_attn_with_kvcache(
-                query[prev_q_end:q_end].unsqueeze(0),
-                k_gathered.unsqueeze(0),
-                v_gathered.unsqueeze(0),
-                causal=True,
-                softmax_scale=self.scale,
-            )
-            output[prev_q_end:q_end] = attn_output.squeeze(0)
-            prev_q_end = q_end
-
+        output[:num_tokens] = attn_output
         return output
 
     def reshape_and_cache(
