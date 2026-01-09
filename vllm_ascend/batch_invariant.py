@@ -724,10 +724,11 @@ def _get_block_sizes(head_dim: int) -> tuple:
     Compute conservative block sizes based on head dimension to avoid NPU UB overflow.
 
     Approximate UB usage per block:
-    - Q_block: BLOCK_M * HEAD_DIM * 2 bytes
-    - K_block: BLOCK_N * HEAD_DIM * 2 bytes
-    - V_block: BLOCK_N * HEAD_DIM * 2 bytes
-    - O_block: BLOCK_M * HEAD_DIM * 2 bytes
+    - Q/K/V/O blocks are promoted to fp32 in-kernel, so size scales with 4 bytes.
+    - Q_block: BLOCK_M * HEAD_DIM_PADDED * 4 bytes
+    - K_block: BLOCK_N * HEAD_DIM_PADDED * 4 bytes
+    - V_block: BLOCK_N * HEAD_DIM_PADDED * 4 bytes
+    - O_block: BLOCK_M * HEAD_DIM_PADDED * 4 bytes
     - Float32 accumulators: BLOCK_M * BLOCK_N * 4 bytes
 
     Args:
@@ -736,7 +737,15 @@ def _get_block_sizes(head_dim: int) -> tuple:
     Returns:
         Tuple of (BLOCK_M, BLOCK_N)
     """
-    BLOCK_M = 64  # Conservative query block size
+    head_dim_padded = triton.next_power_of_2(head_dim)
+
+    # More conservative for padded head dims (192 -> 256, 256 -> 256).
+    if head_dim_padded >= 256:
+        BLOCK_M = 32
+        BLOCK_N = 32
+        return BLOCK_M, BLOCK_N
+
+    BLOCK_M = 64  # Default query block size
 
     # Adjust BLOCK_N based on head dimension to stay within UB limits
     if head_dim <= 64:

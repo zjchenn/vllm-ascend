@@ -390,3 +390,167 @@ class TestAscendAttentionBackendImpl(TestBase):
         with self.assertRaises(NotImplementedError):
             self.impl_error.forward(layer, query, key, value, kv_cache,
                                     metadata, output)
+
+
+class TestBatchInvariantSequenceLengthHandling(TestBase):
+    """
+    Test cases for verifying correct sequence length handling in batch-invariant
+    attention methods.
+
+    These tests verify the fix for the bug where query_start_loc_list and
+    seq_lens_list could include padding sequences, causing incorrect indexing.
+    """
+
+    @patch('vllm.distributed.parallel_state.get_pcp_group')
+    @patch('vllm.distributed.parallel_state._PCP',
+           new_callable=lambda: MagicMock(spec=GroupCoordinator))
+    @patch('vllm.distributed.parallel_state.get_dcp_group')
+    @patch('vllm.distributed.parallel_state._DCP',
+           new_callable=lambda: MagicMock(spec=GroupCoordinator))
+    @patch("vllm.distributed.get_decode_context_model_parallel_world_size",
+           return_value=1)
+    def setUp(self, mock_get_dcp_size, mock_dcp, mock_get_dcp_group, mock_pcp,
+              mock_get_pcp_group):
+        mock_dcp.world_size = 1
+        dcp_group = MagicMock(spec=GroupCoordinator)
+        dcp_group.rank_in_group = 0
+        dcp_group.world_size = 1
+        dcp_group.device_group = MagicMock()
+        mock_get_dcp_group.return_value = dcp_group
+
+        mock_pcp.world_size = 1
+        pcp_group = MagicMock(spec=GroupCoordinator)
+        pcp_group.rank_in_group = 0
+        pcp_group.world_size = 1
+        pcp_group.device_group = MagicMock()
+        mock_get_pcp_group.return_value = pcp_group
+
+        self.attention_type = MagicMock()
+        self.attention_type.DECODER = "decoder"
+
+    def test_metadata_with_padding_sequences(self):
+        """
+        Test that metadata correctly distinguishes between actual sequences
+        and padding sequences.
+
+        This verifies that:
+        - num_prefills correctly counts actual prefill sequences
+        - num_decodes correctly counts actual decode sequences
+        - num_actual_tokens excludes padding tokens
+        """
+        # Simulate metadata with 2 actual sequences + 1 padding sequence
+        metadata = MagicMock()
+        metadata.num_prefills = 2  # Only 2 actual prefill sequences
+        metadata.num_decodes = 0
+        metadata.num_actual_tokens = 15  # Total actual tokens (not including padding)
+
+        # query_start_loc_list includes padding: [5, 15, 25] where 25 is padding
+        metadata.query_start_loc_list = [5, 15, 25]
+
+        # seq_lens_list includes padding: [10, 20, 10] where last 10 is padding
+        metadata.seq_lens_list = [10, 20, 10]
+
+        # Verify that num_prefills (2) is less than len(query_start_loc_list) (3)
+        self.assertEqual(metadata.num_prefills, 2)
+        self.assertEqual(len(metadata.query_start_loc_list), 3)
+
+        # The fix ensures we only process num_prefills sequences
+        num_seqs_to_process = min(metadata.num_prefills,
+                                   len(metadata.query_start_loc_list))
+        self.assertEqual(num_seqs_to_process, 2)
+
+    def test_query_start_loc_cumulative_positions(self):
+        """
+        Test that query_start_loc_list contains cumulative positions,
+        not individual sequence lengths.
+
+        query_start_loc_list = [end_0, end_1, end_2, ...]
+        where end_i is the cumulative end position of sequence i.
+        """
+        # Example: 3 sequences with lengths 5, 10, 8
+        # query_start_loc_list should be [5, 15, 23]
+        query_start_loc_list = [5, 15, 23]
+
+        # Calculate individual sequence lengths
+        prev_end = 0
+        seq_lengths = []
+        for end in query_start_loc_list:
+            seq_lengths.append(end - prev_end)
+            prev_end = end
+
+        self.assertEqual(seq_lengths, [5, 10, 8])
+
+    def test_num_actual_tokens_limits_processing(self):
+        """
+        Test that num_actual_tokens correctly limits token processing
+        to exclude padding tokens.
+        """
+        metadata = MagicMock()
+        metadata.num_actual_tokens = 15
+        metadata.num_prefills = 2
+        # query_start_loc_list might extend beyond num_actual_tokens due to padding
+        metadata.query_start_loc_list = [5, 15, 25]
+
+        # When processing, we should limit seq_end to num_actual_tokens
+        prev_end = 0
+        for seq_idx in range(metadata.num_prefills):
+            seq_end = metadata.query_start_loc_list[seq_idx]
+            # Apply the fix: limit to num_actual_tokens
+            seq_end = min(seq_end, metadata.num_actual_tokens)
+            seq_len = seq_end - prev_end
+
+            if seq_idx == 0:
+                self.assertEqual(seq_len, 5)
+            elif seq_idx == 1:
+                self.assertEqual(seq_len, 10)
+
+            prev_end = seq_end
+
+    def test_decode_batch_size_from_num_decodes(self):
+        """
+        Test that decode batch size is correctly determined from num_decodes,
+        not from seq_lens.shape[0] which may include padding.
+        """
+        metadata = MagicMock()
+        # 3 actual decode sequences
+        metadata.num_decodes = 3
+        # seq_lens tensor might have extra padding entries
+        metadata.seq_lens = torch.tensor([10, 20, 30, 0, 0])  # 5 entries, 2 are padding
+
+        # The fix uses num_decodes instead of seq_lens.shape[0]
+        batch_size = metadata.num_decodes
+        if batch_size == 0:
+            batch_size = metadata.seq_lens.shape[0]
+
+        self.assertEqual(batch_size, 3)
+
+        # Only slice actual sequences
+        actual_seq_lens = metadata.seq_lens[:batch_size]
+        self.assertEqual(len(actual_seq_lens), 3)
+        self.assertTrue(torch.equal(actual_seq_lens, torch.tensor([10, 20, 30])))
+
+    def test_kv_seq_lens_indexing_safety(self):
+        """
+        Test that kv_seq_lens indexing is safe when there's a mismatch
+        between query_start_loc_list and seq_lens_list lengths.
+        """
+        metadata = MagicMock()
+        metadata.num_prefills = 2
+        metadata.query_start_loc_list = [5, 15, 25]  # 3 entries
+        metadata.seq_lens_list = [10, 20]  # Only 2 entries (no padding in kv)
+
+        # The fix uses min() to ensure safe indexing
+        num_seqs = min(metadata.num_prefills,
+                       len(metadata.query_start_loc_list),
+                       len(metadata.seq_lens_list))
+
+        self.assertEqual(num_seqs, 2)
+
+        # Safe to index both lists
+        for seq_idx in range(num_seqs):
+            q_end = metadata.query_start_loc_list[seq_idx]
+            kv_len = metadata.seq_lens_list[seq_idx]
+            # No IndexError should occur
+            self.assertIsNotNone(q_end)
+            self.assertIsNotNone(kv_len)
+

@@ -654,8 +654,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
-        batch_size = attn_metadata.seq_lens.shape[0]
-        seq_lens = attn_metadata.seq_lens  # (batch_size,)
+        # Use num_decodes to get actual batch size (exclude padding)
+        batch_size = attn_metadata.num_decodes
+        if batch_size == 0:
+            # Fallback to seq_lens shape if num_decodes is not set
+            batch_size = attn_metadata.seq_lens.shape[0]
+
+        seq_lens = attn_metadata.seq_lens[:batch_size]  # Only actual sequences
 
         # For decode, each request has exactly 1 query token
         # query shape: [batch_size, num_heads, head_size] (already in TND with T=batch)
@@ -664,7 +669,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # Get KV cache: [num_blocks, block_size, num_kv_heads, head_size]
         # We need to gather the relevant blocks for each sequence
-        block_tables = attn_metadata.block_tables  # [batch_size, max_blocks]
+        block_tables = attn_metadata.block_tables[:batch_size]  # Only actual sequences
 
         # For simplicity in batch-invariant mode, we'll process each sequence
         # independently. This ensures batch invariance at the cost of parallelism.
@@ -771,16 +776,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Q and K/V have the same length per sequence.
         """
         # Get sequence boundaries from query_start_loc
-        query_start_loc = attn_metadata.query_start_loc_list  # List of cumulative positions
-        num_seqs = len(query_start_loc)
+        # query_start_loc_list contains cumulative positions [end_0, end_1, ...]
+        # but may include padding sequences, so we use num_prefills to limit
+        query_start_loc = attn_metadata.query_start_loc_list
+        num_actual_seqs = attn_metadata.num_prefills
+
+        # Limit to actual sequences (exclude padding)
+        num_seqs = min(num_actual_seqs, len(query_start_loc))
+
+        # Also limit by num_actual_tokens to avoid processing padding tokens
+        num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Process each sequence independently
         prev_end = 0
         for seq_idx in range(num_seqs):
             seq_end = query_start_loc[seq_idx]
+
+            # Ensure we don't exceed actual tokens
+            seq_end = min(seq_end, num_actual_tokens)
             seq_len = seq_end - prev_end
 
-            if seq_len == 0:
+            if seq_len <= 0:
                 prev_end = seq_end
                 continue
 
@@ -831,16 +847,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_tables = attn_metadata.block_tables
         block_size = self.key_cache.shape[1]
 
-        num_seqs = len(query_start_loc)
+        # Use num_prefills to limit to actual sequences (exclude padding)
+        num_actual_seqs = attn_metadata.num_prefills
+        num_seqs = min(num_actual_seqs, len(query_start_loc), len(kv_seq_lens))
+
+        # Also limit by num_actual_tokens to avoid processing padding tokens
+        num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Process each sequence independently
         prev_q_end = 0
         for seq_idx in range(num_seqs):
             q_end = query_start_loc[seq_idx]
+
+            # Ensure we don't exceed actual tokens
+            q_end = min(q_end, num_actual_tokens)
             q_len = q_end - prev_q_end
             kv_len = kv_seq_lens[seq_idx]
 
-            if q_len == 0:
+            if q_len <= 0 or kv_len <= 0:
                 prev_q_end = q_end
                 continue
 
