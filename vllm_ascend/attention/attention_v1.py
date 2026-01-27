@@ -836,30 +836,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         """
         Batch-invariant prefill with KV cache (chunked prefill or cache hit).
-        Q length may differ from K/V length.
-        K/V must be gathered from paged KV cache.
         """
-        # Get sequence info
-        # query_start_loc_list: cumulative Q token positions [q_end_0, q_end_1, ...]
-        # seq_lens_list: K/V lengths for each sequence [kv_len_0, kv_len_1, ...]
+        import os
+        debug_mode = os.getenv("VLLM_DEBUG_BATCH_INVARIANT", "0") == "1"
+
         query_start_loc = attn_metadata.query_start_loc_list
         kv_seq_lens = attn_metadata.seq_lens_list
         block_tables = attn_metadata.block_tables
         block_size = self.key_cache.shape[1]
 
-        # Use num_prefills to limit to actual sequences (exclude padding)
         num_actual_seqs = attn_metadata.num_prefills
         num_seqs = min(num_actual_seqs, len(query_start_loc), len(kv_seq_lens))
-
-        # Also limit by num_actual_tokens to avoid processing padding tokens
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Process each sequence independently
+        if debug_mode:
+            print(f"\n[PREFILL CACHE] num_seqs={num_seqs}, tokens={num_actual_tokens}")
+
         prev_q_end = 0
         for seq_idx in range(num_seqs):
             q_end = query_start_loc[seq_idx]
-
-            # Ensure we don't exceed actual tokens
             q_end = min(q_end, num_actual_tokens)
             q_len = q_end - prev_q_end
             kv_len = kv_seq_lens[seq_idx]
@@ -868,13 +863,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 prev_q_end = q_end
                 continue
 
-            # Extract Q for this sequence
-            q_seq = query[prev_q_end:q_end]  # [q_len, num_heads, head_size]
+            q_seq = query[prev_q_end:q_end]
 
-            # Gather K/V from paged cache for this sequence
+            if debug_mode:
+                print(f"  Seq{seq_idx}: q_len={q_len}, kv_len={kv_len}, Q_range=[{q_seq.min():.2f}, {q_seq.max():.2f}]")
+
             num_blocks_needed = (kv_len + block_size - 1) // block_size
 
-            # Allocate contiguous K/V tensors
             k_gathered = torch.zeros(
                 kv_len, self.num_kv_heads, self.head_size,
                 dtype=query.dtype, device=query.device
@@ -891,27 +886,38 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 end_pos = min(start_pos + block_size, kv_len)
                 actual_len = end_pos - start_pos
 
-                k_gathered[start_pos:end_pos] = self.key_cache[block_num, :actual_len]
-                v_gathered[start_pos:end_pos] = self.value_cache[block_num, :actual_len]
+                assert 0 <= block_num < self.key_cache.shape[0], \
+                    f"Block OOB: {block_num} >= {self.key_cache.shape[0]}"
 
-            # Convert to BSHD: [1, seq_len, num_heads, head_size]
+                k_block = self.key_cache[block_num, :actual_len]
+                v_block = self.value_cache[block_num, :actual_len]
+
+                assert not torch.isnan(k_block).any(), f"NaN in K block"
+                assert not torch.isinf(k_block).any(), f"Inf in K block"
+
+                k_gathered[start_pos:end_pos] = k_block
+                v_gathered[start_pos:end_pos] = v_block
+
+            if debug_mode:
+                print(f"    K_gathered=[{k_gathered.min():.2f}, {k_gathered.max():.2f}]")
+
             q_bshd = q_seq.unsqueeze(0)
             k_bshd = k_gathered.unsqueeze(0)
             v_bshd = v_gathered.unsqueeze(0)
 
-            # Call batch-invariant flash attention
-            # Note: Q length != K/V length for chunked prefill
             attn_output = flash_attn_with_kvcache(
-                q_bshd,
-                k_bshd,
-                v_bshd,
+                q_bshd, k_bshd, v_bshd,
                 causal=True,
                 softmax_scale=self.scale,
             )
 
-            # Convert back to TND and store
-            output[prev_q_end:q_end] = attn_output.squeeze(0)
+            if debug_mode:
+                print(f"    Output=[{attn_output.min():.2f}, {attn_output.max():.2f}]")
 
+            assert not torch.isnan(attn_output).any(), f"NaN in output"
+            assert not torch.isinf(attn_output).any(), f"Inf in output"
+
+            output[prev_q_end:q_end] = attn_output.squeeze(0)
             prev_q_end = q_end
 
         return output
@@ -949,13 +955,62 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if not forward_context.capturing:
             # Check if batch-invariant mode is enabled
             if self.batch_invariant_mode:
-                # Use batch-invariant flash attention
-                if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                    output = self._forward_decode_only_batch_invariant(
-                        query, attn_metadata, output)
+                # DEBUG: Compare batch-invariant vs NPU kernel outputs
+                import os
+                debug_mode = os.getenv("VLLM_DEBUG_BATCH_INVARIANT", "0") == "1"
+
+                if debug_mode:
+                    # Create separate output tensors for comparison
+                    output_npu = torch.zeros_like(output)
+                    output_batch_inv = torch.zeros_like(output)
+
+                    # Run NPU kernel
+                    with torch.no_grad():
+                        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                            output_npu = self._forward_decode_only(
+                                query.clone(), attn_metadata, output_npu)
+                        else:
+                            output_npu = self._forward_prefill(
+                                query.clone(), key.clone(), value.clone(),
+                                attn_metadata, output_npu)
+
+                    # Run batch-invariant kernel
+                    if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                        output_batch_inv = self._forward_decode_only_batch_invariant(
+                            query, attn_metadata, output_batch_inv)
+                    else:
+                        output_batch_inv = self._forward_prefill_batch_invariant(
+                            query, key, value, attn_metadata, output_batch_inv)
+
+                    # Compare outputs
+                    num_actual_tokens = attn_metadata.num_actual_tokens
+                    diff = torch.abs(output_npu[:num_actual_tokens] - output_batch_inv[:num_actual_tokens])
+
+                    has_nan = torch.isnan(output_batch_inv[:num_actual_tokens]).any()
+                    has_inf = torch.isinf(output_batch_inv[:num_actual_tokens]).any()
+                    allclose_1e2 = torch.allclose(output_npu[:num_actual_tokens],
+                                                  output_batch_inv[:num_actual_tokens],
+                                                  rtol=1e-2, atol=1e-2)
+
+                    print(f"\n[DEBUG] {attn_metadata.attn_state}, {num_actual_tokens} tokens")
+                    print(f"  NPU:    range [{output_npu[:num_actual_tokens].min():.4f}, {output_npu[:num_actual_tokens].max():.4f}]")
+                    print(f"  Triton: range [{output_batch_inv[:num_actual_tokens].min():.4f}, {output_batch_inv[:num_actual_tokens].max():.4f}]")
+                    print(f"  Diff:   mean {diff.mean():.2e}, max {diff.max():.2e}")
+                    print(f"  Status: allclose(1e-2)={allclose_1e2}, NaN={has_nan}, Inf={has_inf}")
+                    if has_nan or has_inf or not allclose_1e2:
+                        print(f"  ⚠️  WARNING: Precision issue detected!")
+
+                    # Use batch-invariant output
+                    output = output_batch_inv
                 else:
-                    output = self._forward_prefill_batch_invariant(
-                        query, key, value, attn_metadata, output)
+                    # Normal execution without debug overhead
+                    # Use batch-invariant flash attention
+                    if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                        output = self._forward_decode_only_batch_invariant(
+                            query, attn_metadata, output)
+                    else:
+                        output = self._forward_prefill_batch_invariant(
+                            query, key, value, attn_metadata, output)
             else:
                 # Use standard NPU attention kernels
                 if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:

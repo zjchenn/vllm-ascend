@@ -920,7 +920,9 @@ def _flash_attn_with_kvcache_kernel(
         l_i = l_new
 
     # Final normalization
-    acc = acc / l_i[:, None]
+    # Add numerical stability check: prevent division by zero
+    l_i_safe = tl.where(l_i > 0, l_i, 1.0)  # Replace zero with 1.0 to prevent nan/inf
+    acc = acc / l_i_safe[:, None]
 
     # Write output
     O_block_ptr = (O_ptr +
