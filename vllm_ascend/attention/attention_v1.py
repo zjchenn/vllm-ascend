@@ -934,12 +934,31 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
-            torch_npu._npu_reshape_and_cache(
-                key=key[:attn_metadata.num_actual_tokens],
-                value=value[:attn_metadata.num_actual_tokens],
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                slot_indices=slots)
+
+            # 在 batch_invariant 模式下，使用 torch 原生操作而不是 NPU 算子
+            # 避免 layout 不一致问题
+            if self.batch_invariant_mode:
+                num_tokens = attn_metadata.num_actual_tokens
+                key_to_cache = key[:num_tokens]
+                value_to_cache = value[:num_tokens]
+                block_size = self.key_cache.shape[1]
+
+                # 手动写入 cache
+                for i in range(num_tokens):
+                    slot_idx = slots[i].item()
+                    block_idx = slot_idx // block_size
+                    offset_in_block = slot_idx % block_size
+
+                    self.key_cache[block_idx, offset_in_block] = key_to_cache[i]
+                    self.value_cache[block_idx, offset_in_block] = value_to_cache[i]
+            else:
+                # 非 batch_invariant 模式，使用 NPU 算子（更快）
+                torch_npu._npu_reshape_and_cache(
+                    key=key[:attn_metadata.num_actual_tokens],
+                    value=value[:attn_metadata.num_actual_tokens],
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    slot_indices=slots)
         return key, value
 
     def forward_impl(
